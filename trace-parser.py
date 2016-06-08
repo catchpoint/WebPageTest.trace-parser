@@ -105,6 +105,8 @@ class Trace():
         else:
           if thread not in self.threads:
             self.threads[thread] = {}
+          if self.start_time is None or trace_event['ts'] < self.start_time:
+            self.start_time = trace_event['ts']
           self.cpu['main_thread'] = thread
           if 'dur' not in trace_event:
             trace_event['dur'] = 1
@@ -138,9 +140,7 @@ class Trace():
           elif 'dur' in trace_event:
             e['e'] = e['s'] + trace_event['dur']
 
-        if e is not None and 'e' in e:
-          if self.start_time is None or e['s'] < self.start_time:
-            self.start_time = e['s']
+        if e is not None and 'e' in e and e['s'] >= self.start_time and e['e'] >= e['s']:
           if self.end_time is None or e['e'] > self.end_time:
             self.end_time = e['e']
           # attach it to a parent event if there is one
@@ -169,19 +169,16 @@ class Trace():
 
       # Create the empty time slices for all of the threads
       self.cpu['slices'] = {}
-      self.cpu['times'] = {}
       for thread in self.threads.keys():
         self.cpu['slices'][thread] = {}
-        self.cpu['times'][thread] = {}
         for name in self.threads[thread].keys():
           self.cpu['slices'][thread][name] = [0.0] * slice_count
-          self.cpu['times'][thread][name] = 0
 
       # Go through all of the timeline events recursively and account for the time they consumed
       for timeline_event in self.timeline_events:
         self.ProcessTimelineEvent(timeline_event, None)
 
-      # Go through all of the fractional times and convert the float fractional tims to integer percentages
+      # Go through all of the fractional times and convert the float fractional times to integer percentages
       # (serializes to MUCH smaller files) and has more than enough accuracy four our needs
       for thread in self.cpu['slices'].keys():
         for name in self.cpu['slices'][thread].keys():
@@ -195,27 +192,15 @@ class Trace():
       thread = timeline_event['t']
       name = self.event_name_lookup[timeline_event['n']]
       slice_usecs = self.cpu['slice_usecs']
-      start_whole = int(math.ceil(float(start) / float(slice_usecs)))
-      end_whole = int(float(end) / float(slice_usecs))
-      if end_whole >= start_whole:
-        # Consume 100% of the slices that are fully enclosed by the event
-        for slice_number in range(start_whole, end_whole + 1):
-          self.AdjustTimelineSlice(thread, slice_number, name, parent, slice_usecs)
-        # Consume the fractional slice at the beginning of the event
-        start_elapsed = (start_whole * slice_usecs) - start
-        if start_elapsed > 0:
-          slice_number = int(float(start) / float(slice_usecs))
-          self.AdjustTimelineSlice(thread, slice_number, name, parent, start_elapsed)
-        # Consume the fractional slice at the end of the event
-        end_elapsed = end - (end_whole * slice_usecs)
-        if end_elapsed > 0:
-          slice_number = int(math.ceil(float(end) / float(slice_usecs)))
-          self.AdjustTimelineSlice(thread, slice_number, name, parent, end_elapsed)
-      else:
-        # whole event fits in one slice
-        elapsed = end - start
-        slice_number = int(float(start) / float(slice_usecs))
-        self.AdjustTimelineSlice(thread, slice_number, name, parent, elapsed)
+      first_slice = int(float(start) / float(slice_usecs))
+      last_slice = int(float(end) / float(slice_usecs))
+      for slice_number in range(first_slice, last_slice + 1):
+        slice_start = slice_number * slice_usecs;
+        slice_end = slice_start + slice_usecs;
+        used_start = max(slice_start, start)
+        used_end = min(slice_end, end)
+        slice_elapsed = used_end - used_start
+        self.AdjustTimelineSlice(thread, slice_number, name, parent, slice_elapsed)
 
       # Recursively process any child events
       if 'c' in timeline_event:
@@ -225,14 +210,19 @@ class Trace():
   # Add the time to the given slice and subtract the time from a parent event
   def AdjustTimelineSlice(self, thread, slice_number, name, parent, elapsed):
     try:
-      self.cpu['times'][thread][name] += elapsed
-      fraction = float(elapsed) / float(self.cpu['slice_usecs'])
+      fraction = min(1.0, float(elapsed) / float(self.cpu['slice_usecs']))
       self.cpu['slices'][thread][name][slice_number] =\
         min(1.0, self.cpu['slices'][thread][name][slice_number] + fraction)
       if parent is not None:
-        self.cpu['times'][thread][parent] = max(0, self.cpu['times'][thread][parent] - elapsed)
-        self.cpu['slices'][thread][parent][slice_number] = \
+        self.cpu['slices'][thread][parent][slice_number] =\
           max(0.0, self.cpu['slices'][thread][parent][slice_number] - fraction)
+      # make sure we don't exceed 100% for any slot
+      available = 1.0 - fraction
+      for slice_name in self.cpu['slices'][thread].keys():
+        if slice_name != name:
+          self.cpu['slices'][thread][slice_name][slice_number] =\
+            min(self.cpu['slices'][thread][slice_name][slice_number], available)
+          available -= self.cpu['slices'][thread][slice_name][slice_number]
     except:
       pass
 
