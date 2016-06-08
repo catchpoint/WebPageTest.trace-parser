@@ -178,12 +178,12 @@ class Trace():
       for timeline_event in self.timeline_events:
         self.ProcessTimelineEvent(timeline_event, None)
 
-      # Go through all of the fractional times and convert the float fractional times to integer percentages
-      # (serializes to MUCH smaller files) and has more than enough accuracy four our needs
+      # Go through all of the fractional times and convert the float fractional times to integer usecs
       for thread in self.cpu['slices'].keys():
         for name in self.cpu['slices'][thread].keys():
           for slice in range(len(self.cpu['slices'][thread][name])):
-            self.cpu['slices'][thread][name][slice] = int(round(self.cpu['slices'][thread][name][slice] * 100))
+            self.cpu['slices'][thread][name][slice] =\
+              int(self.cpu['slices'][thread][name][slice] * self.cpu['slice_usecs'])
 
   def ProcessTimelineEvent(self, timeline_event, parent):
     start = timeline_event['s'] - self.start_time
