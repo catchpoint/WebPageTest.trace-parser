@@ -15,11 +15,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import gzip
-import json
 import logging
 import math
 import os
 import time
+
+# try importing (or installing if necessary) a fast json parser
+try:
+  import ujson as json
+except:
+  try:
+    import pip
+    pip.main(['install', 'ujson'])
+    import ujson as json
+  except:
+    import json
 
 ########################################################################################################################
 #   Trace processing
@@ -107,14 +117,15 @@ class Trace():
 
   def ProcessTraceEvent(self, trace_event):
     cat = trace_event['cat']
-    if cat.find('blink.user_timing') >= 0:
-      self.user_timing.append(trace_event)
-    if cat.find('blink.feature_usage') >= 0:
-      self.ProcessFeatureUsageEvent(trace_event)
-    if cat.find('netlog') >= 0:
-      self.ProcessNetlogEvent(trace_event)
     if cat.find('devtools.timeline') >= 0:
       self.ProcessTimelineTraceEvent(trace_event)
+    elif cat.find('blink.feature_usage') >= 0:
+      self.ProcessFeatureUsageEvent(trace_event)
+    elif cat.find('blink.user_timing') >= 0:
+      self.user_timing.append(trace_event)
+    #Netlog support is still in progress
+    #elif cat.find('netlog') >= 0:
+    #  self.ProcessNetlogEvent(trace_event)
 
 
   ########################################################################################################################
@@ -203,7 +214,7 @@ class Trace():
       # Create the empty time slices for all of the threads
       self.cpu['slices'] = {}
       for thread in self.threads.keys():
-        self.cpu['slices'][thread] = {}
+        self.cpu['slices'][thread] = {'total': [0.0] * slice_count}
         for name in self.threads[thread].keys():
           self.cpu['slices'][thread][name] = [0.0] * slice_count
 
@@ -213,6 +224,7 @@ class Trace():
 
       # Go through all of the fractional times and convert the float fractional times to integer usecs
       for thread in self.cpu['slices'].keys():
+        del self.cpu['slices'][thread]['total']
         for name in self.cpu['slices'][thread].keys():
           for slice in range(len(self.cpu['slices'][thread][name])):
             self.cpu['slices'][thread][name][slice] =\
@@ -264,22 +276,23 @@ class Trace():
       # since they would just cancel each other out.
       if name != parent:
         fraction = min(1.0, float(elapsed) / float(self.cpu['slice_usecs']))
-        self.cpu['slices'][thread][name][slice_number] = self.cpu['slices'][thread][name][slice_number] + fraction
-        if parent is not None:
-          parentTime = self.cpu['slices'][thread][parent][slice_number]
-          if parentTime >= fraction:
-            parentTime = max(0.0, parentTime - fraction)
-            self.cpu['slices'][thread][parent][slice_number] = parentTime
+        self.cpu['slices'][thread][name][slice_number] += fraction
+        self.cpu['slices'][thread]['total'] += fraction
+        if parent is not None and self.cpu['slices'][thread][parent][slice_number] >= fraction:
+          self.cpu['slices'][thread][parent][slice_number] -= fraction
+          self.cpu['slices'][thread]['total'] -= fraction
         # Make sure we didn't exceed 100% in this slice
         self.cpu['slices'][thread][name][slice_number] = min(1.0, self.cpu['slices'][thread][name][slice_number])
 
         # make sure we don't exceed 100% for any slot
-        available = max(0.0, 1.0 - fraction)
-        for slice_name in self.cpu['slices'][thread].keys():
-          if slice_name != name:
-            self.cpu['slices'][thread][slice_name][slice_number] =\
-              min(self.cpu['slices'][thread][slice_name][slice_number], available)
-            available = max(0.0, available - self.cpu['slices'][thread][slice_name][slice_number])
+        if self.cpu['slices'][thread]['total'] > 1.0:
+          available = max(0.0, 1.0 - fraction)
+          for slice_name in self.cpu['slices'][thread].keys():
+            if slice_name != name:
+              self.cpu['slices'][thread][slice_name][slice_number] =\
+                min(self.cpu['slices'][thread][slice_name][slice_number], available)
+              available = max(0.0, available - self.cpu['slices'][thread][slice_name][slice_number])
+          self.cpu['slices'][thread]['total'] = min(1.0, max(0.0, 1.0 - available))
     except:
       pass
 
@@ -2200,4 +2213,6 @@ BLINK_CSS_FEATURES = {
 
 
 if '__main__' == __name__:
+  #import cProfile
+  #cProfile.run('main()')
   main()
