@@ -40,6 +40,9 @@ class Trace():
     self.scripts = None
     self.timeline_events = []
     self.trace_events = []
+    self.interactive = []
+    self.interactive_start = 0
+    self.interactive_end = None
     self.start_time = None
     self.end_time = None
     self.cpu = {'main_thread': None}
@@ -75,6 +78,9 @@ class Trace():
 
   def WriteFeatureUsage(self, file):
     self.WriteJson(file, self.feature_usage)
+
+  def WriteInteractive(self, file):
+    self.WriteJson(file, self.interactive)
 
   def WriteNetlog(self, file):
     self.WriteJson(file, self.netlog)
@@ -318,6 +324,8 @@ class Trace():
       # Go through all of the timeline events recursively and account for the time they consumed
       for timeline_event in self.timeline_events:
         self.ProcessTimelineEvent(timeline_event, None)
+      if self.interactive_end is not None and self.interactive_end - self.interactive_start > 500000:
+        self.interactive.append([int(math.ceil(self.interactive_start / 1000.0)), int(math.floor(self.interactive_end / 1000.0))])
 
       # Go through all of the fractional times and convert the float fractional times to integer usecs
       for thread in self.cpu['slices'].keys():
@@ -334,6 +342,16 @@ class Trace():
       elapsed = end - start
       thread = timeline_event['t']
       name = self.event_name_lookup[timeline_event['n']]
+
+      # Keep track of periods on the main thread where at least 500ms are available with no tasks longer than 50ms
+      if 'main_thread' in self.cpu and thread == self.cpu['main_thread']:
+        if elapsed > 50000:
+          if start - self.interactive_start > 500000:
+            self.interactive.append([int(math.ceil(self.interactive_start / 1000.0)), int(math.floor(start / 1000.0))])
+          self.interactive_start = end
+          self.interactive_end = None
+        else:
+          self.interactive_end = end
 
       if 'js' in timeline_event:
         script = timeline_event['js']
@@ -512,6 +530,7 @@ def main():
   parser.add_argument('-j', '--js', help="Output Javascript per-script parse/evaluate/execute timings.")
   parser.add_argument('-u', '--user', help="Output user timing file.")
   parser.add_argument('-f', '--features', help="Output blink feature usage file.")
+  parser.add_argument('-i', '--interactive', help="Output list of interactive times.")
   parser.add_argument('-n', '--netlog', help="Output netlog details file.")
   options, unknown = parser.parse_known_args()
 
@@ -548,6 +567,9 @@ def main():
 
   if options.features:
     trace.WriteFeatureUsage(options.features)
+
+  if options.interactive:
+    trace.WriteInteractive(options.interactive)
 
   if options.netlog:
     trace.WriteNetlog(options.netlog)
