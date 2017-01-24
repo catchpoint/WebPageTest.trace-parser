@@ -50,6 +50,7 @@ class Trace():
     self.feature_usage_start_time = None
     self.netlog = {'bytes_in': 0, 'bytes_out': 0}
     self.v8stats = None
+    self.v8stack = {}
     return
 
   ########################################################################################################################
@@ -164,7 +165,7 @@ class Trace():
             cat.find('devtools.timeline') >= 0 or \
             cat.find('blink.feature_usage') >= 0 or \
             cat.find('blink.user_timing') >= 0 or \
-            cat.find('v8.runtime_stats') >= 0:
+            cat.find('v8') >= 0:
       self.trace_events.append(trace_event)
 
   def ProcessTraceEvents(self):
@@ -186,8 +187,8 @@ class Trace():
       self.ProcessFeatureUsageEvent(trace_event)
     elif cat.find('blink.user_timing') >= 0:
       self.user_timing.append(trace_event)
-    elif cat.find('v8.runtime_stats') >= 0:
-      self.ProcessV8StatEvent(trace_event)
+    elif cat.find('v8') >= 0:
+      self.ProcessV8Event(trace_event)
     #Netlog support is still in progress
     #elif cat.find('netlog') >= 0:
     #  self.ProcessNetlogEvent(trace_event)
@@ -528,21 +529,41 @@ class Trace():
   ########################################################################################################################
   #   V8 call stats
   ########################################################################################################################
-  def ProcessV8StatEvent(self, trace_event):
+  def ProcessV8Event(self, trace_event):
     try:
       if self.start_time is not None and self.cpu['main_thread'] is not None and trace_event['ts'] >= self.start_time and \
-              "args" in trace_event and "runtime-call-stats" in trace_event["args"]:
-        if self.v8stats is None:
-          self.v8stats = {"main_thread": self.cpu['main_thread']}
+              "name" in trace_event:
         thread = '{0}:{1}'.format(trace_event['pid'], trace_event['tid'])
-        if thread not in self.v8stats:
-          self.v8stats[thread] = {}
-          for name in trace_event["args"]["runtime-call-stats"]:
-            if len(trace_event["args"]["runtime-call-stats"][name]) == 2:
-              if name not in self.v8stats[thread]:
-                self.v8stats[thread][name] = {"count": 0, "dur": 0.0}
-              self.v8stats[thread][name]["count"] += int(trace_event["args"]["runtime-call-stats"][name][0]);
-              self.v8stats[thread][name]["dur"] += float(trace_event["args"]["runtime-call-stats"][name][1]) / 1000.0;
+        if trace_event["ph"] == "B":
+          if thread not in self.v8stack:
+            self.v8stack[thread] = []
+          self.v8stack[thread].append(trace_event)
+        else:
+          duration = 0.0
+          if trace_event["ph"] == "E" and thread in self.v8stack:
+            start_event = self.v8stack[thread].pop()
+            if start_event['name'] == trace_event['name'] and 'ts' in start_event and start_event['ts'] <= trace_event['ts']:
+              duration = trace_event['ts'] - start_event['ts']
+          elif trace_event['ph'] == 'X' and 'dur' in trace_event:
+            duration = trace_event['dur']
+          if self.v8stats is None:
+            self.v8stats = {"main_thread": self.cpu['main_thread']}
+          if thread not in self.v8stats:
+            self.v8stats[thread] = {}
+          name = trace_event["name"]
+          if name == "V8.RuntimeStats":
+            name = "V8.ParseOnBackground"
+
+          if name not in self.v8stats[thread]:
+            self.v8stats[thread][name] = {"dur": 0.0, "events": {}}
+          self.v8stats[thread][name]['dur'] += float(duration) / 1000.0
+          if 'args' in trace_event and 'runtime-call-stats' in trace_event["args"]:
+            for stat in trace_event["args"]["runtime-call-stats"]:
+              if len(trace_event["args"]["runtime-call-stats"][stat]) == 2:
+                if stat not in self.v8stats[thread][name]['events']:
+                  self.v8stats[thread][name]['events'][stat] = {"count": 0, "dur": 0.0}
+                self.v8stats[thread][name]['events'][stat]["count"] += int(trace_event["args"]["runtime-call-stats"][stat][0])
+                self.v8stats[thread][name]['events'][stat]["dur"] += float(trace_event["args"]["runtime-call-stats"][stat][1]) / 1000.0
     except:
       pass
 
