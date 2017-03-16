@@ -23,12 +23,14 @@ import time
 # try a fast json parser if it is installed
 try:
     import ujson as json
-except:
+except BaseException:
     import json
 
 ##########################################################################
 #   Trace processing
 ##########################################################################
+
+
 class Trace():
     def __init__(self):
         self.thread_stack = {}
@@ -65,7 +67,7 @@ class Trace():
             else:
                 with open(file, 'w') as f:
                     json.dump(json_data, f)
-        except:
+        except BaseException:
             logging.critical("Error writing to " + file)
 
     def WriteUserTiming(self, file):
@@ -113,9 +115,9 @@ class Trace():
                     else:
                         line_mode = True
                         self.FilterTraceEvent(trace_event)
-                except:
+                except BaseException:
                     pass
-        except:
+        except BaseException:
             logging.critical("Error processing trace " + trace)
         if f is not None:
             f.close()
@@ -154,7 +156,7 @@ class Trace():
                                 if e is not None:
                                     self.timeline_events.append(e)
                 self.ProcessTimelineEvents()
-        except:
+        except BaseException:
             logging.critical("Error processing timeline " + timeline)
         if f is not None:
             f.close()
@@ -221,7 +223,8 @@ class Trace():
 
         # Build timeline events on a stack. 'B' begins an event, 'E' ends an
         # event
-        if (thread in self.threads and ('dur' in trace_event or trace_event['ph'] == 'B' or trace_event['ph'] == 'E')):
+        if (thread in self.threads and (
+                'dur' in trace_event or trace_event['ph'] == 'B' or trace_event['ph'] == 'E')):
             trace_event['thread'] = self.threads[thread]
             if thread not in self.thread_stack:
                 self.thread_stack[thread] = []
@@ -239,14 +242,16 @@ class Trace():
                     if e['n'] == self.event_names[trace_event['name']]:
                         e['e'] = trace_event['ts']
             else:
-                e = {
-                    't': thread, 'n': self.event_names[trace_event['name']], 's': trace_event['ts']}
+                e = {'t': thread,
+                     'n': self.event_names[trace_event['name']],
+                     's': trace_event['ts']}
                 if (trace_event['name'] == 'EvaluateScript' or trace_event['name'] == 'v8.compile' or trace_event['name'] == 'v8.parseOnBackground')\
                         and 'args' in trace_event and 'data' in trace_event['args'] and 'url' in trace_event['args']['data'] and\
                         trace_event['args']['data']['url'].startswith('http'):
                     e['js'] = trace_event['args']['data']['url']
                 if trace_event['name'] == 'FunctionCall' and 'args' in trace_event and 'data' in trace_event['args']:
-                    if 'scriptName' in trace_event['args']['data'] and trace_event['args']['data']['scriptName'].startswith('http'):
+                    if 'scriptName' in trace_event['args']['data'] and trace_event['args']['data']['scriptName'].startswith(
+                            'http'):
                         e['js'] = trace_event['args']['data']['scriptName']
                     elif 'url' in trace_event['args']['data'] and trace_event['args']['data']['url'].startswith('http'):
                         e['js'] = trace_event['args']['data']['url']
@@ -293,7 +298,8 @@ class Trace():
                 self.end_time = end
             e = {'t': thread,
                  'n': self.event_names[type], 's': start, 'e': end}
-            if 'callInfo' in event and 'url' in event and event['url'].startswith('http'):
+            if 'callInfo' in event and 'url' in event and event['url'].startswith(
+                    'http'):
                 e['js'] = event['url']
             # Process profile child events
             if 'data' in event and 'profile' in event['data'] and 'rootNodes' in event['data']['profile']:
@@ -323,12 +329,17 @@ class Trace():
             while slice_count > 2000:
                 last_exp = exp
                 exp += 1
-                slice_count = int(
-                    math.ceil(float(self.end_time - self.start_time) / float(pow(10, exp))))
+                slice_count = int(math.ceil(
+                    float(self.end_time - self.start_time) / float(pow(10, exp))))
             self.cpu['total_usecs'] = self.end_time - self.start_time
             self.cpu['slice_usecs'] = int(pow(10, last_exp))
-            slice_count = int(math.ceil(
-                float(self.end_time - self.start_time) / float(self.cpu['slice_usecs'])))
+            slice_count = int(
+                math.ceil(
+                    float(
+                        self.end_time -
+                        self.start_time) /
+                    float(
+                        self.cpu['slice_usecs'])))
 
             # Create the empty time slices for all of the threads
             self.cpu['slices'] = {}
@@ -341,7 +352,8 @@ class Trace():
             # the time they consumed
             for timeline_event in self.timeline_events:
                 self.ProcessTimelineEvent(timeline_event, None)
-            if self.interactive_end is not None and self.interactive_end - self.interactive_start > 500000:
+            if self.interactive_end is not None and self.interactive_end - \
+                    self.interactive_start > 500000:
                 self.interactive.append([int(math.ceil(
                     self.interactive_start / 1000.0)), int(math.floor(self.interactive_end / 1000.0))])
 
@@ -446,7 +458,7 @@ class Trace():
                                 0.0, available - self.cpu['slices'][thread][slice_name][slice_number])
                     self.cpu['slices'][thread]['total'][slice_number] = min(
                         1.0, max(0.0, 1.0 - available))
-        except:
+        except BaseException:
             pass
 
     ##########################################################################
@@ -457,10 +469,12 @@ class Trace():
         if 'name' in trace_event and\
                 'args' in trace_event and\
                 'feature' in trace_event['args'] and\
-        (trace_event['name'] == 'FeatureFirstUsed' or trace_event['name'] == 'CSSFirstUsed'):
+            (trace_event['name'] == 'FeatureFirstUsed' or trace_event['name'] == 'CSSFirstUsed'):
             if self.feature_usage is None:
                 self.feature_usage = {
-                    'Features': {}, 'CSSFeatures': {}, 'AnimatedCSSFeatures': {}}
+                    'Features': {},
+                    'CSSFeatures': {},
+                    'AnimatedCSSFeatures': {}}
             if self.feature_usage_start_time is None:
                 if self.start_time is not None:
                     self.feature_usage_start_time = self.start_time
@@ -495,9 +509,11 @@ class Trace():
     #   Netlog
     ##########################################################################
     def ProcessNetlogEvent(self, trace_event):
-        if 'args' in trace_event and 'id' in trace_event and 'name' in trace_event and 'source_type' in trace_event['args']:
+        if 'args' in trace_event and 'id' in trace_event and 'name' in trace_event and 'source_type' in trace_event[
+                'args']:
             # Convert the source event id to hex if one exists
-            if 'params' in trace_event['args'] and 'source_dependency' in trace_event['args']['params'] and 'id' in trace_event['args']['params']['source_dependency']:
+            if 'params' in trace_event['args'] and 'source_dependency' in trace_event['args'][
+                    'params'] and 'id' in trace_event['args']['params']['source_dependency']:
                 dependency_id = int(
                     trace_event['args']['params']['source_dependency']['id'])
                 trace_event['args']['params']['source_dependency']['id'] = 'x%X' % dependency_id
@@ -512,8 +528,8 @@ class Trace():
     #######################################################################
     def ProcessV8Event(self, trace_event):
         try:
-            if self.start_time is not None and self.cpu['main_thread'] is not None and trace_event['ts'] >= self.start_time and \
-                    "name" in trace_event:
+            if self.start_time is not None and self.cpu['main_thread'] is not None and trace_event[
+                    'ts'] >= self.start_time and "name" in trace_event:
                 thread = '{0}:{1}'.format(
                     trace_event['pid'], trace_event['tid'])
                 if trace_event["ph"] == "B":
@@ -542,7 +558,8 @@ class Trace():
                         duration) / 1000.0
                     if 'args' in trace_event and 'runtime-call-stats' in trace_event["args"]:
                         for stat in trace_event["args"]["runtime-call-stats"]:
-                            if len(trace_event["args"]["runtime-call-stats"][stat]) == 2:
+                            if len(trace_event["args"]
+                                   ["runtime-call-stats"][stat]) == 2:
                                 if stat not in self.v8stats[thread][name]['events']:
                                     self.v8stats[thread][name]['events'][stat] = {
                                         "count": 0, "dur": 0.0}
@@ -550,7 +567,7 @@ class Trace():
                                     trace_event["args"]["runtime-call-stats"][stat][0])
                                 self.v8stats[thread][name]['events'][stat]["dur"] += float(
                                     trace_event["args"]["runtime-call-stats"][stat][1]) / 1000.0
-        except:
+        except BaseException:
             pass
 
 
@@ -561,14 +578,19 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='Chrome trace parser.',
                                      prog='trace-parser')
-    parser.add_argument('-v', '--verbose', action='count',
-                        help="Increase verbosity (specify multiple times for more). -vvvv for full debug output.")
+    parser.add_argument(
+        '-v',
+        '--verbose',
+        action='count',
+        help="Increase verbosity (specify multiple times for more). -vvvv for full debug output.")
     parser.add_argument('-t', '--trace', help="Input trace file.")
     parser.add_argument('-l', '--timeline',
                         help="Input timeline file (iOS or really old Chrome).")
     parser.add_argument('-c', '--cpu', help="Output CPU time slices file.")
     parser.add_argument(
-        '-j', '--js', help="Output Javascript per-script parse/evaluate/execute timings.")
+        '-j',
+        '--js',
+        help="Output Javascript per-script parse/evaluate/execute timings.")
     parser.add_argument('-u', '--user', help="Output user timing file.")
     parser.add_argument('-f', '--features',
                         help="Output blink feature usage file.")
@@ -589,7 +611,9 @@ def main():
     elif options.verbose >= 4:
         log_level = logging.DEBUG
     logging.basicConfig(
-        level=log_level, format="%(asctime)s.%(msecs)03d - %(message)s", datefmt="%H:%M:%S")
+        level=log_level,
+        format="%(asctime)s.%(msecs)03d - %(message)s",
+        datefmt="%H:%M:%S")
 
     if not options.trace and not options.timeline:
         parser.error("Input trace or timeline file is not specified.")
@@ -2147,8 +2171,7 @@ BLINK_FEATURES = {
     "1853": "HTMLMediaElementControlsListAttribute",
     "1854": "HTMLMediaElementControlsListNoDownload",
     "1855": "HTMLMediaElementControlsListNoFullscreen",
-    "1856": "HTMLMediaElementControlsListNoRemotePlayback"
-}
+    "1856": "HTMLMediaElementControlsListNoRemotePlayback"}
 
 ##########################################################################
 #   CSS feature names from https://cs.chromium.org/chromium/src/third_party/WebKit/Source/core/frame/UseCounter.cpp
