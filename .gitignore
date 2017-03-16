@@ -63,3 +63,8 @@ target/
 /.idea
 /*.json
 /*.gz
+/.vscode
+/*.mobile
+/1_trace_timeline
+/background.js
+/laxpress_trace.json.gz.2
