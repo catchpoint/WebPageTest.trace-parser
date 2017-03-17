@@ -50,7 +50,7 @@ class Trace():
         self.cpu = {'main_thread': None}
         self.feature_usage = None
         self.feature_usage_start_time = None
-        self.netlog = {'bytes_in': 0, 'bytes_out': 0}
+        self.netlog = {'bytes_in': 0, 'bytes_out': 0, 'next_redirect_id': 1000000}
         self.v8stats = None
         self.v8stack = {}
         return
@@ -818,6 +818,11 @@ class Trace():
             entry['uncompressed_bytes_in'] += params['byte_count']
         if 'stream_id' in params:
             entry['stream_id'] = params['stream_id']
+        if name == 'URL_REQUEST_REDIRECTED':
+            new_id = self.netlog['next_redirect_id']
+            self.netlog['next_redirect_id'] += 1
+            self.netlog['url_request'][new_id] = entry
+            del self.netlog['url_request'][request_id]
 
 
     #######################################################################
