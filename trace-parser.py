@@ -802,7 +802,7 @@ class Trace():
                     entry['request_headers'].append('{0}: {1}'.format(key, params['headers'][key]))
             else:
                 entry['request_headers'] = params['headers']
-            entry['protocol'] = 'http/2'
+            entry['protocol'] = 'HTTP/2'
         if 'headers' in params and name == 'HTTP_TRANSACTION_READ_RESPONSE_HEADERS':
             entry['response_headers'] = params['headers']
             if 'first_byte' not in entry:
