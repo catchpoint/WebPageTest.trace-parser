@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import time
+import urlparse
 
 # try a fast json parser if it is installed
 try:
@@ -29,9 +30,8 @@ except BaseException:
 ##########################################################################
 #   Trace processing
 ##########################################################################
-
-
 class Trace():
+    """Main class"""
     def __init__(self):
         self.thread_stack = {}
         self.ignore_threads = {}
@@ -58,40 +58,43 @@ class Trace():
     ##########################################################################
     #   Output Logging
     ##########################################################################
-    def WriteJson(self, file, json_data):
+    def write_json(self, out_file, json_data):
+        """Write out one of the internal structures as a json blob"""
         try:
-            file_name, ext = os.path.splitext(file)
+            _, ext = os.path.splitext(out_file)
             if ext.lower() == '.gz':
-                with gzip.open(file, 'wb') as f:
+                with gzip.open(out_file, 'wb') as f:
                     json.dump(json_data, f)
             else:
-                with open(file, 'w') as f:
+                with open(out_file, 'w') as f:
                     json.dump(json_data, f)
         except BaseException:
-            logging.critical("Error writing to " + file)
+            logging.critical("Error writing to " + out_file)
 
-    def WriteUserTiming(self, file):
-        self.WriteJson(file, self.user_timing)
+    def WriteUserTiming(self, out_file):
+        self.write_json(out_file, self.user_timing)
 
-    def WriteCPUSlices(self, file):
-        self.WriteJson(file, self.cpu)
+    def WriteCPUSlices(self, out_file):
+        self.write_json(out_file, self.cpu)
 
-    def WriteScriptTimings(self, file):
+    def WriteScriptTimings(self, out_file):
         if self.scripts is not None:
-            self.WriteJson(file, self.scripts)
+            self.write_json(out_file, self.scripts)
 
-    def WriteFeatureUsage(self, file):
-        self.WriteJson(file, self.feature_usage)
+    def WriteFeatureUsage(self, out_file):
+        self.write_json(out_file, self.feature_usage)
 
-    def WriteInteractive(self, file):
-        self.WriteJson(file, self.interactive)
+    def WriteInteractive(self, out_file):
+        self.write_json(out_file, self.interactive)
 
-    def WriteNetlog(self, file):
-        self.WriteJson(file, self.netlog)
+    def WriteNetlog(self, out_file):
+        out = self.post_process_netlog_events()
+        if out is not None:
+            self.write_json(out_file, out)
 
-    def WriteV8Stats(self, file):
+    def WriteV8Stats(self, out_file):
         if self.v8stats is not None:
-            self.WriteJson(file, self.v8stats)
+            self.write_json(out_file, self.v8stats)
 
     ##########################################################################
     #   Top-level processing
@@ -142,7 +145,8 @@ class Trace():
                 for event in events:
                     if 'method' in event and 'params' in event:
                         if self.start_time is None:
-                            if event['method'] == 'Network.requestWillBeSent' and 'timestamp' in event['params']:
+                            if event['method'] == 'Network.requestWillBeSent' and \
+                                    'timestamp' in event['params']:
                                 self.start_time = event['params']['timestamp'] * 1000000.0
                                 self.end_time = event['params']['timestamp'] * 1000000.0
                         else:
@@ -150,7 +154,8 @@ class Trace():
                                 t = event['params']['timestamp'] * 1000000.0
                                 if t > self.end_time:
                                     self.end_time = t
-                            if event['method'] == 'Timeline.eventRecorded' and 'record' in event['params']:
+                            if event['method'] == 'Timeline.eventRecorded' and \
+                                    'record' in event['params']:
                                 e = self.ProcessOldTimelineEvent(
                                     event['params']['record'], None)
                                 if e is not None:
@@ -169,6 +174,7 @@ class Trace():
                 cat.find('devtools.timeline') >= 0 or \
                 cat.find('blink.feature_usage') >= 0 or \
                 cat.find('blink.user_timing') >= 0 or \
+                cat.find('netlog') >= 0 or \
                 cat.find('v8') >= 0:
             self.trace_events.append(trace_event)
 
@@ -203,8 +209,11 @@ class Trace():
         thread = '{0}:{1}'.format(trace_event['pid'], trace_event['tid'])
 
         # Keep track of the main thread
-        if self.cpu['main_thread'] is None and trace_event['name'] == 'ResourceSendRequest' and 'args' in trace_event and \
-                'data' in trace_event['args'] and 'url' in trace_event['args']['data']:
+        if self.cpu['main_thread'] is None and \
+                trace_event['name'] == 'ResourceSendRequest' and \
+                'args' in trace_event and \
+                'data' in trace_event['args'] and \
+                'url' in trace_event['args']['data']:
             if trace_event['args']['data']['url'][:21] == 'http://127.0.0.1:8888':
                 self.ignore_threads[thread] = True
             else:
@@ -217,7 +226,9 @@ class Trace():
                     trace_event['dur'] = 1
 
         # Make sure each thread has a numerical ID
-        if self.cpu['main_thread'] is not None and thread not in self.threads and thread not in self.ignore_threads and \
+        if self.cpu['main_thread'] is not None and \
+                thread not in self.threads and \
+                thread not in self.ignore_threads and \
                 trace_event['name'] != 'Program':
             self.threads[thread] = {}
 
@@ -230,11 +241,9 @@ class Trace():
                 self.thread_stack[thread] = []
             if trace_event['name'] not in self.event_names:
                 self.event_names[trace_event['name']] = len(self.event_names)
-                self.event_name_lookup[self.event_names[trace_event['name']]
-                                       ] = trace_event['name']
+                self.event_name_lookup[self.event_names[trace_event['name']]] = trace_event['name']
             if trace_event['name'] not in self.threads[thread]:
-                self.threads[thread][trace_event['name']
-                                     ] = self.event_names[trace_event['name']]
+                self.threads[thread][trace_event['name']] = self.event_names[trace_event['name']]
             e = None
             if trace_event['ph'] == 'E':
                 if len(self.thread_stack[thread]) > 0:
@@ -242,9 +251,7 @@ class Trace():
                     if e['n'] == self.event_names[trace_event['name']]:
                         e['e'] = trace_event['ts']
             else:
-                e = {'t': thread,
-                     'n': self.event_names[trace_event['name']],
-                     's': trace_event['ts']}
+                e = {'t': thread, 'n': self.event_names[trace_event['name']], 's': trace_event['ts']}
                 if (trace_event['name'] == 'EvaluateScript' or trace_event['name'] == 'v8.compile' or trace_event['name'] == 'v8.parseOnBackground')\
                         and 'args' in trace_event and 'data' in trace_event['args'] and 'url' in trace_event['args']['data'] and\
                         trace_event['args']['data']['url'].startswith('http'):
@@ -329,17 +336,12 @@ class Trace():
             while slice_count > 2000:
                 last_exp = exp
                 exp += 1
-                slice_count = int(math.ceil(
-                    float(self.end_time - self.start_time) / float(pow(10, exp))))
+                slice_count = int(
+                    math.ceil(float(self.end_time - self.start_time) / float(pow(10, exp))))
             self.cpu['total_usecs'] = self.end_time - self.start_time
             self.cpu['slice_usecs'] = int(pow(10, last_exp))
-            slice_count = int(
-                math.ceil(
-                    float(
-                        self.end_time -
-                        self.start_time) /
-                    float(
-                        self.cpu['slice_usecs'])))
+            slice_count = int(math.ceil(
+                float(self.end_time - self.start_time) / float(self.cpu['slice_usecs'])))
 
             # Create the empty time slices for all of the threads
             self.cpu['slices'] = {}
@@ -354,8 +356,8 @@ class Trace():
                 self.ProcessTimelineEvent(timeline_event, None)
             if self.interactive_end is not None and self.interactive_end - \
                     self.interactive_start > 500000:
-                self.interactive.append([int(math.ceil(
-                    self.interactive_start / 1000.0)), int(math.floor(self.interactive_end / 1000.0))])
+                self.interactive.append([int(math.ceil(self.interactive_start / 1000.0)),
+                                         int(math.floor(self.interactive_end / 1000.0))])
 
             # Go through all of the fractional times and convert the float
             # fractional times to integer usecs
@@ -381,7 +383,8 @@ class Trace():
                 if elapsed > 50000:
                     if start - self.interactive_start > 500000:
                         self.interactive.append(
-                            [int(math.ceil(self.interactive_start / 1000.0)), int(math.floor(start / 1000.0))])
+                            [int(math.ceil(self.interactive_start / 1000.0)),
+                             int(math.floor(start / 1000.0))])
                     self.interactive_start = end
                     self.interactive_end = None
                 else:
@@ -389,8 +392,8 @@ class Trace():
 
             if 'js' in timeline_event:
                 script = timeline_event['js']
-                s = start / 1000.0
-                e = end / 1000.0
+                js_start = start / 1000.0
+                js_end = end / 1000.0
                 if self.scripts is None:
                     self.scripts = {}
                 if 'main_thread' not in self.scripts and 'main_thread' in self.cpu:
@@ -406,11 +409,11 @@ class Trace():
                 new_duration = True
                 if len(self.scripts[thread][script][name]):
                     for period in self.scripts[thread][script][name]:
-                        if s >= period[0] and e <= period[1]:
+                        if js_start >= period[0] and js_end <= period[1]:
                             new_duration = False
                             break
                 if new_duration:
-                    self.scripts[thread][script][name].append([s, e])
+                    self.scripts[thread][script][name].append([js_start, js_end])
 
             slice_usecs = self.cpu['slice_usecs']
             first_slice = int(float(start) / float(slice_usecs))
@@ -439,7 +442,8 @@ class Trace():
                                float(self.cpu['slice_usecs']))
                 self.cpu['slices'][thread][name][slice_number] += fraction
                 self.cpu['slices'][thread]['total'][slice_number] += fraction
-                if parent is not None and self.cpu['slices'][thread][parent][slice_number] >= fraction:
+                if parent is not None and \
+                        self.cpu['slices'][thread][parent][slice_number] >= fraction:
                     self.cpu['slices'][thread][parent][slice_number] -= fraction
                     self.cpu['slices'][thread]['total'][slice_number] -= fraction
                 # Make sure we didn't exceed 100% in this slice
@@ -454,8 +458,8 @@ class Trace():
                             self.cpu['slices'][thread][slice_name][slice_number] =\
                                 min(self.cpu['slices'][thread]
                                     [slice_name][slice_number], available)
-                            available = max(
-                                0.0, available - self.cpu['slices'][thread][slice_name][slice_number])
+                            available = max(0.0, available - \
+                                            self.cpu['slices'][thread][slice_name][slice_number])
                     self.cpu['slices'][thread]['total'][slice_number] = min(
                         1.0, max(0.0, 1.0 - available))
         except BaseException:
@@ -472,9 +476,7 @@ class Trace():
             (trace_event['name'] == 'FeatureFirstUsed' or trace_event['name'] == 'CSSFirstUsed'):
             if self.feature_usage is None:
                 self.feature_usage = {
-                    'Features': {},
-                    'CSSFeatures': {},
-                    'AnimatedCSSFeatures': {}}
+                    'Features': {}, 'CSSFeatures': {}, 'AnimatedCSSFeatures': {}}
             if self.feature_usage_start_time is None:
                 if self.start_time is not None:
                     self.feature_usage_start_time = self.start_time
@@ -509,27 +511,322 @@ class Trace():
     #   Netlog
     ##########################################################################
     def ProcessNetlogEvent(self, trace_event):
-        if 'args' in trace_event and 'id' in trace_event and 'name' in trace_event and 'source_type' in trace_event[
-                'args']:
-            # Convert the source event id to hex if one exists
-            if 'params' in trace_event['args'] and 'source_dependency' in trace_event['args'][
-                    'params'] and 'id' in trace_event['args']['params']['source_dependency']:
-                dependency_id = int(
-                    trace_event['args']['params']['source_dependency']['id'])
-                trace_event['args']['params']['source_dependency']['id'] = 'x%X' % dependency_id
-            if trace_event['args']['source_type'] == 'HOST_RESOLVER_IMPL_JOB':
-                self.ProcessNetlogDnsEvent(trace_event)
+        if 'args' in trace_event and 'id' in trace_event and 'name' in trace_event and \
+                'source_type' in trace_event['args']:
+            try:
+                trace_event['id'] = int(trace_event['id'], 16)
+                event_type = trace_event['args']['source_type']
+                if event_type == 'CONNECT_JOB' or \
+                        event_type == 'SSL_CONNECT_JOB' or \
+                        event_type == 'TRANSPORT_CONNECT_JOB':
+                    self.ProcessNetlogConnectJobEvent(trace_event)
+                elif event_type == 'HTTP_STREAM_JOB':
+                    self.ProcessNetlogStreamJobEvent(trace_event)
+                elif event_type == 'HTTP2_SESSION':
+                    self.ProcessNetlogHttp2SessionEvent(trace_event)
+                elif event_type == 'HOST_RESOLVER_IMPL_JOB':
+                    self.ProcessNetlogDnsEvent(trace_event)
+                elif event_type == 'SOCKET':
+                    self.ProcessNetlogSocketEvent(trace_event)
+                elif event_type == 'URL_REQUEST':
+                    self.ProcessNetlogUrlRequestEvent(trace_event)
+            except Exception:
+                pass
+
+    def post_process_netlog_events(self):
+        """Post-process the raw netlog events into request data"""
+        requests = []
+        if 'url_request' in self.netlog:
+            for request_id in self.netlog['url_request']:
+                request = self.netlog['url_request'][request_id]
+                if 'url' in request and request['url'][:16] != 'http://127.0.0.1' and \
+                        'start' in request:
+                    # Copy any http/2 info over
+                    if 'h2_session' in self.netlog and \
+                            'h2_session' in request and \
+                            request['h2_session'] in self.netlog['h2_session']:
+                        h2_session = self.netlog['h2_session'][request['h2_session']]
+                        if 'stream_id' in request and \
+                                'stream' in h2_session and \
+                                request['stream_id'] in h2_session['stream']:
+                            stream = h2_session['stream'][request['stream_id']]
+                            if 'request_headers' in stream:
+                                request['request_headers'] = stream['request_headers']
+                            if 'response_headers' in stream:
+                                request['response_headers'] = stream['response_headers']
+                            if 'exclusive' in stream:
+                                request['exclusive'] = stream['exclusive']
+                            if 'parent_stream_id' in stream:
+                                request['parent_stream_id'] = stream['parent_stream_id']
+                            if 'weight' in stream:
+                                request['weight'] = stream['weight']
+                    requests.append(request)
+            if len(requests):
+                # Sort the requests by the start time
+                requests.sort(key=lambda x: x['start'])
+                # Assign the socket connect time to the first request on each socket
+                if 'socket' in self.netlog:
+                    for request in requests:
+                        if 'socket' in request and request['socket'] in self.netlog['socket']:
+                            socket = self.netlog['socket'][request['socket']]
+                            if 'claimed' not in socket:
+                                socket['claimed'] = True
+                                if 'connect_start' in socket:
+                                    request['connect_start'] = socket['connect_start']
+                                if 'connect_end' in socket:
+                                    request['connect_end'] = socket['connect_end']
+                                if 'ssl_start' in socket:
+                                    request['ssl_start'] = socket['ssl_start']
+                                if 'ssl_end' in socket:
+                                    request['ssl_end'] = socket['ssl_end']
+                # Assign the DNS lookup to the first request that connected to the DocumentSetDomain
+                if 'dns' in self.netlog:
+                    # Build a mapping of the DNS lookups for each domain
+                    dns_lookups = {}
+                    for dns_id in self.netlog['dns']:
+                        dns = self.netlog['dns'][dns_id]
+                        if 'host' in dns and 'start' in dns:
+                            hostname = dns['host']
+                            if hostname not in dns_lookups:
+                                dns_lookups[hostname] = dns
+                            elif dns['start'] < dns_lookups[hostname]['start']:
+                                dns_lookups[hostname] = dns
+                    # Go through the requests and assign the DNS lookups as needed
+                    for request in requests:
+                        if 'connect_start' in request:
+                            hostname = urlparse.urlparse(request['url']).hostname
+                            if hostname in dns_lookups and 'claimed' not in dns_lookups[hostname]:
+                                dns = dns_lookups[hostname]
+                                dns['claimed'] = True
+                                request['dns_start'] = dns['start']
+                                if 'end' in dns:
+                                    request['dns_end'] = dns['end']
+                # Find the start timestamp if we didn't have one already
+                times = ['dns_start', 'dns_end',
+                         'connect_start', 'connect_end',
+                         'ssl_start', 'ssl_end',
+                         'start', 'first_byte', 'end']
+                if self.start_time is None:
+                    for request in requests:
+                        for time_name in times:
+                            if time_name in request:
+                                if self.start_time is None or request[time_name] < self.start_time:
+                                    self.start_time = request[time_name]
+                # Go through and adjust all of the times to be relative in ms
+                if self.start_time is not None:
+                    for request in requests:
+                        for time_name in times:
+                            if time_name in request:
+                                request[time_name] = \
+                                        float(request[time_name] - self.start_time) / 1000.0
+                else:
+                    requests = []
+        if not len(requests):
+            requests = None
+        return requests
+
+    def ProcessNetlogConnectJobEvent(self, trace_event):
+        """Connect jobs link sockets to DNS lookups/group names"""
+        if 'connect_job' not in self.netlog:
+            self.netlog['connect_job'] = {}
+        request_id = trace_event['id']
+        if request_id not in self.netlog['connect_job']:
+            self.netlog['connect_job'][request_id] = {}
+        params = trace_event['args']['params'] if 'params' in trace_event['args'] else {}
+        entry = self.netlog['connect_job'][request_id]
+        name = trace_event['name']
+        if 'source_dependency' in params and 'id' in params['source_dependency']:
+            if name == 'CONNECT_JOB_SET_SOCKET':
+                socket_id = params['source_dependency']['id']
+                entry['socket'] = socket_id
+                if 'socket' in self.netlog and socket_id in self.netlog['socket']:
+                    if 'group' in entry:
+                        self.netlog['socket'][socket_id]['group'] = entry['group']
+                    if 'dns' in entry:
+                        self.netlog['socket'][socket_id]['dns'] = entry['dns']
+        if 'group_name' in params:
+            entry['group'] = params['group_name']
+
+    def ProcessNetlogStreamJobEvent(self, trace_event):
+        """Strem jobs leank requests to sockets"""
+        if 'stream_job' not in self.netlog:
+            self.netlog['stream_job'] = {}
+        request_id = trace_event['id']
+        if request_id not in self.netlog['stream_job']:
+            self.netlog['stream_job'][request_id] = {}
+        params = trace_event['args']['params'] if 'params' in trace_event['args'] else {}
+        entry = self.netlog['stream_job'][request_id]
+        name = trace_event['name']
+        if 'source_dependency' in params and 'id' in params['source_dependency']:
+            if name == 'SOCKET_POOL_BOUND_TO_SOCKET':
+                socket_id = params['source_dependency']['id']
+                entry['socket'] = socket_id
+                if 'url_request' in entry and entry['urlrequest'] in self.netlog['urlrequest']:
+                    self.netlog['urlrequest'][entry['urlrequest']]['socket'] = socket_id
+            if name == 'HTTP_STREAM_JOB_BOUND_TO_REQUEST':
+                url_request_id = params['source_dependency']['id']
+                entry['url_request'] = url_request_id
+                if url_request_id in self.netlog['url_request']:
+                    url_request = self.netlog['url_request'][url_request_id]
+                    if 'socket' in entry:
+                        url_request['socket'] = entry['socket']
+                    if 'h2_session' in entry:
+                        url_request['h2_session'] = entry['h2_session']
+            if name == 'HTTP2_SESSION_POOL_IMPORTED_SESSION_FROM_SOCKET' or \
+                    name == 'HTTP2_SESSION_POOL_FOUND_EXISTING_SESSION':
+                h2_session_id = params['source_dependency']['id']
+                entry['h2_session'] = h2_session_id
+                if 'url_request' in entry and entry['urlrequest'] in self.netlog['urlrequest']:
+                    self.netlog['urlrequest'][entry['urlrequest']]['h2_session'] = h2_session_id
+
+    def ProcessNetlogHttp2SessionEvent(self, trace_event):
+        """Raw H2 session information (linked to sockets and requests)"""
+        if 'h2_session' not in self.netlog:
+            self.netlog['h2_session'] = {}
+        request_id = trace_event['id']
+        if request_id not in self.netlog['h2_session']:
+            self.netlog['h2_session'][request_id] = {'stream': {}}
+        params = trace_event['args']['params'] if 'params' in trace_event['args'] else {}
+        entry = self.netlog['h2_session'][request_id]
+        name = trace_event['name']
+        if 'source_dependency' in params and 'id' in params['source_dependency']:
+            if name == 'HTTP2_SESSION_INITIALIZED':
+                socket_id = params['source_dependency']['id']
+                entry['socket'] = socket_id
+                if 'socket' in self.netlog and socket_id in self.netlog['socket']:
+                    self.netlog['socket']['h2_session'] = request_id
+        if 'host' not in entry and 'host' in params:
+            entry['host'] = params['host']
+        if 'protocol' not in entry and 'protocol' in params:
+            entry['protocol'] = params['protocol']
+        if 'stream_id' in params:
+            stream_id = params['stream_id']
+            if stream_id not in entry['stream']:
+                entry['stream'][stream_id] = {'bytes_in': 0, 'bytes_out': 0}
+            stream = entry['stream'][stream_id]
+            if name == 'HTTP2_SESSION_RECV_DATA' and 'size' in params:
+                stream['bytes_in'] += params['size']
+            if name == 'HTTP2_SESSION_SEND_HEADERS':
+                if 'headers' in params:
+                    stream['request_headers'] = params['headers']
+                if 'exclusive' in params:
+                    stream['exclusive'] = params['exclusive']
+                if 'parent_stream_id' in params:
+                    stream['parent_stream_id'] = params['parent_stream_id']
+                if 'weight' in params:
+                    stream['weight'] = params['weight']
+            if name == 'HTTP2_SESSION_RECV_HEADERS':
+                if 'headers' in params:
+                    stream['response_headers'] = params['headers']
 
     def ProcessNetlogDnsEvent(self, trace_event):
-        pass
+        if 'dns' not in self.netlog:
+            self.netlog['dns'] = {}
+        request_id = trace_event['id']
+        if request_id not in self.netlog['dns']:
+            self.netlog['dns'][request_id] = {}
+        params = trace_event['args']['params'] if 'params' in trace_event['args'] else {}
+        entry = self.netlog['dns'][request_id]
+        name = trace_event['name']
+        if 'source_dependency' in params and 'id' in params['source_dependency']:
+            parent_id = params['source_dependency']['id']
+            if 'connect_job' in self.netlog and parent_id in self.netlog['connect_job']:
+                self.netlog['connect_job'][parent_id]['dns'] = request_id
+        if 'start' not in entry and name == 'HOST_RESOLVER_IMPL_ATTEMPT_STARTED':
+            entry['start'] = trace_event['ts']
+        if name == 'HOST_RESOLVER_IMPL_ATTEMPT_FINISHED':
+            entry['end'] = trace_event['ts']
+        if 'host' not in entry and 'host' in params:
+            entry['host'] = params['host']
+        if 'address_list' in params:
+            entry['address_list'] = params['address_list']
+
+    def ProcessNetlogSocketEvent(self, trace_event):
+        if 'socket' not in self.netlog:
+            self.netlog['socket'] = {}
+        request_id = trace_event['id']
+        if request_id not in self.netlog['socket']:
+            self.netlog['socket'][request_id] = {'bytes_out': 0, 'bytes_in': 0,
+                                                 'chunks_out': [], 'chunks_in': []}
+        params = trace_event['args']['params'] if 'params' in trace_event['args'] else {}
+        entry = self.netlog['socket'][request_id]
+        name = trace_event['name']
+        if 'address' in params:
+            entry['address'] = params['address']
+        if 'source_address' in params:
+            entry['source_address'] = params['source_address']
+        if 'connect_start' not in entry and name == 'TCP_CONNECT_ATTEMPT' and \
+                trace_event['ph'] == 'b':
+            entry['connect_start'] = trace_event['ts']
+        if name == 'TCP_CONNECT_ATTEMPT' and trace_event['ph'] == 'e':
+            entry['connect_end'] = trace_event['ts']
+        if 'ssl_start' not in entry and name == 'SSL_CONNECT' and trace_event['ph'] == 'b':
+            entry['ssl_start'] = trace_event['ts']
+        if name == 'SSL_CONNECT' and trace_event['ph'] == 'e':
+            entry['ssl_end'] = trace_event['ts']
+        if name == 'SOCKET_BYTES_SENT' and 'byte_count' in params:
+            entry['bytes_out'] += params['byte_count']
+            entry['chunks_out'].append({'ts': trace_event['ts'], 'bytes': params['byte_count']})
+        if name == 'SOCKET_BYTES_RECEIVED' and 'byte_count' in params:
+            entry['bytes_in'] += params['byte_count']
+            entry['chunks_in'].append({'ts': trace_event['ts'], 'bytes': params['byte_count']})
+        if name == 'SSL_CERTIFICATES_RECEIVED' and 'certificates' in params:
+            if 'certificates' not in entry:
+                entry['certificates'] = []
+            entry['certificates'].extend(params['certificates'])
+
+    def ProcessNetlogUrlRequestEvent(self, trace_event):
+        if 'url_request' not in self.netlog:
+            self.netlog['url_request'] = {}
+        request_id = trace_event['id']
+        if request_id not in self.netlog['url_request']:
+            self.netlog['url_request'][request_id] = {'bytes_in': 0, 'chunks': []}
+        params = trace_event['args']['params'] if 'params' in trace_event['args'] else {}
+        entry = self.netlog['url_request'][request_id]
+        name = trace_event['name']
+        if 'priority' in params:
+            entry['priority'] = params['priority']
+        if 'method' in params:
+            entry['method'] = params['method']
+        if 'url' in params:
+            entry['url'] = params['url']
+        if 'start' not in entry and name == 'HTTP_TRANSACTION_SEND_REQUEST' and \
+                trace_event['ph'] == 'e':
+            entry['start'] = trace_event['ts']
+        if 'headers' in params and name == 'HTTP_TRANSACTION_SEND_REQUEST_HEADERS':
+            entry['request_headers'] = params['headers']
+        if 'headers' in params and name == 'HTTP_TRANSACTION_HTTP2_SEND_REQUEST_HEADERS':
+            if isinstance(params['headers'], dict):
+                entry['request_headers'] = []
+                for key in params['headers']:
+                    entry['request_headers'].append('{0}: {1}'.format(key, params['headers'][key]))
+            else:
+                entry['request_headers'] = params['headers']
+            entry['protocol'] = 'http/2'
+        if 'headers' in params and name == 'HTTP_TRANSACTION_READ_RESPONSE_HEADERS':
+            entry['response_headers'] = params['headers']
+            if 'first_byte' not in entry:
+                entry['first_byte'] = trace_event['ts']
+            entry['end'] = trace_event['ts']
+        if 'byte_count' in params and name == 'URL_REQUEST_JOB_BYTES_READ':
+            entry['end'] = trace_event['ts']
+            entry['bytes_in'] += params['byte_count']
+            entry['chunks'].append({'ts': trace_event['ts'], 'bytes': params['byte_count']})
+        if 'byte_count' in params and name == 'URL_REQUEST_JOB_FILTERED_BYTES_READ':
+            if 'uncompressed_bytes_in' not in entry:
+                entry['uncompressed_bytes_in'] = 0
+            entry['uncompressed_bytes_in'] += params['byte_count']
+        if 'stream_id' in params:
+            entry['stream_id'] = params['stream_id']
+
 
     #######################################################################
     #   V8 call stats
     #######################################################################
     def ProcessV8Event(self, trace_event):
         try:
-            if self.start_time is not None and self.cpu['main_thread'] is not None and trace_event[
-                    'ts'] >= self.start_time and "name" in trace_event:
+            if self.start_time is not None and self.cpu['main_thread'] is not None and trace_event['ts'] >= self.start_time and \
+                    "name" in trace_event:
                 thread = '{0}:{1}'.format(
                     trace_event['pid'], trace_event['tid'])
                 if trace_event["ph"] == "B":
@@ -578,19 +875,14 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='Chrome trace parser.',
                                      prog='trace-parser')
-    parser.add_argument(
-        '-v',
-        '--verbose',
-        action='count',
-        help="Increase verbosity (specify multiple times for more). -vvvv for full debug output.")
+    parser.add_argument('-v', '--verbose', action='count',
+                        help="Increase verbosity (specify multiple times for more). -vvvv for full debug output.")
     parser.add_argument('-t', '--trace', help="Input trace file.")
     parser.add_argument('-l', '--timeline',
                         help="Input timeline file (iOS or really old Chrome).")
     parser.add_argument('-c', '--cpu', help="Output CPU time slices file.")
     parser.add_argument(
-        '-j',
-        '--js',
-        help="Output Javascript per-script parse/evaluate/execute timings.")
+        '-j', '--js', help="Output Javascript per-script parse/evaluate/execute timings.")
     parser.add_argument('-u', '--user', help="Output user timing file.")
     parser.add_argument('-f', '--features',
                         help="Output blink feature usage file.")
@@ -611,9 +903,7 @@ def main():
     elif options.verbose >= 4:
         log_level = logging.DEBUG
     logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s.%(msecs)03d - %(message)s",
-        datefmt="%H:%M:%S")
+        level=log_level, format="%(asctime)s.%(msecs)03d - %(message)s", datefmt="%H:%M:%S")
 
     if not options.trace and not options.timeline:
         parser.error("Input trace or timeline file is not specified.")
@@ -2171,7 +2461,8 @@ BLINK_FEATURES = {
     "1853": "HTMLMediaElementControlsListAttribute",
     "1854": "HTMLMediaElementControlsListNoDownload",
     "1855": "HTMLMediaElementControlsListNoFullscreen",
-    "1856": "HTMLMediaElementControlsListNoRemotePlayback"}
+    "1856": "HTMLMediaElementControlsListNoRemotePlayback"
+}
 
 ##########################################################################
 #   CSS feature names from https://cs.chromium.org/chromium/src/third_party/WebKit/Source/core/frame/UseCounter.cpp
