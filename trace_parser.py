@@ -177,6 +177,7 @@ class Trace():
                 cat.find('devtools.timeline') >= 0 or \
                 cat.find('blink.feature_usage') >= 0 or \
                 cat.find('blink.user_timing') >= 0 or \
+                cat.find('loading') >= 0 or \
                 cat.find('netlog') >= 0 or \
                 cat.find('v8') >= 0:
             self.trace_events.append(trace_event)
@@ -201,12 +202,14 @@ class Trace():
 
     def ProcessTraceEvent(self, trace_event):
         cat = trace_event['cat']
+        if cat.find('blink.user_timing') >= 0 or cat.find('rail') >= 0 or \
+                cat.find('loading') >= 0:
+            if 'args' in trace_event and 'frame' in trace_event['args']:
+                self.user_timing.append(trace_event)
         if cat == 'devtools.timeline' or cat.find('devtools.timeline') >= 0:
             self.ProcessTimelineTraceEvent(trace_event)
         elif cat.find('blink.feature_usage') >= 0:
             self.ProcessFeatureUsageEvent(trace_event)
-        elif cat.find('blink.user_timing') >= 0:
-            self.user_timing.append(trace_event)
         elif cat.find('v8') >= 0:
             self.ProcessV8Event(trace_event)
         elif cat.find('netlog') >= 0:
