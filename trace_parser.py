@@ -178,6 +178,7 @@ class Trace():
                 cat.find('blink.feature_usage') >= 0 or \
                 cat.find('blink.user_timing') >= 0 or \
                 cat.find('loading') >= 0 or \
+                cat.find('rail') >= 0 or \
                 cat.find('netlog') >= 0 or \
                 cat.find('v8') >= 0:
             self.trace_events.append(trace_event)
