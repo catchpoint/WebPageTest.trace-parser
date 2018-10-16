@@ -565,7 +565,10 @@ class Trace():
                 if isinstance(trace_event['id'], (str, unicode)):
                     trace_event['id'] = int(trace_event['id'], 16)
                 event_type = trace_event['args']['source_type']
-                if event_type == 'CONNECT_JOB' or \
+                if event_type == 'HOST_RESOLVER_IMPL_JOB' or \
+                        trace_event['name'].startswith('HOST_RESOLVER'):
+                    self.ProcessNetlogDnsEvent(trace_event)
+                elif event_type == 'CONNECT_JOB' or \
                         event_type == 'SSL_CONNECT_JOB' or \
                         event_type == 'TRANSPORT_CONNECT_JOB':
                     self.ProcessNetlogConnectJobEvent(trace_event)
@@ -573,8 +576,6 @@ class Trace():
                     self.ProcessNetlogStreamJobEvent(trace_event)
                 elif event_type == 'HTTP2_SESSION':
                     self.ProcessNetlogHttp2SessionEvent(trace_event)
-                elif event_type == 'HOST_RESOLVER_IMPL_JOB':
-                    self.ProcessNetlogDnsEvent(trace_event)
                 elif event_type == 'SOCKET':
                     self.ProcessNetlogSocketEvent(trace_event)
                 elif event_type == 'URL_REQUEST':
@@ -606,7 +607,7 @@ class Trace():
                             if 'response_headers' in stream:
                                 request['response_headers'] = stream['response_headers']
                             if 'exclusive' in stream:
-                                request['exclusive'] = stream['exclusive']
+                                request['exclusive'] = 1 if stream['exclusive'] else 0
                             if 'parent_stream_id' in stream:
                                 request['parent_stream_id'] = stream['parent_stream_id']
                             if 'weight' in stream:
@@ -652,11 +653,15 @@ class Trace():
                     dns_lookups = {}
                     for dns_id in self.netlog['dns']:
                         dns = self.netlog['dns'][dns_id]
-                        if 'host' in dns and 'start' in dns:
+                        if 'host' in dns and 'start' in dns and 'end' in dns and 'address_list' in dns:
                             hostname = dns['host']
+                            separator = hostname.find(':')
+                            if separator > 0:
+                                hostname = hostname[:separator]
+                            dns['elapsed'] = dns['end'] - dns['start']
                             if hostname not in dns_lookups:
                                 dns_lookups[hostname] = dns
-                            elif dns['start'] < dns_lookups[hostname]['start']:
+                            elif dns['elapsed'] > dns_lookups[hostname]['elapsed']:
                                 dns_lookups[hostname] = dns
                     # Go through the requests and assign the DNS lookups as needed
                     for request in requests:
@@ -666,7 +671,8 @@ class Trace():
                                 dns = dns_lookups[hostname]
                                 dns['claimed'] = True
                                 request['dns_start'] = dns['start']
-                                if 'end' in dns:
+                                request['dns_end'] = request['connect_start']
+                                if 'end' in dns and dns['end'] < request['dns_end']:
                                     request['dns_end'] = dns['end']
                 # Find the start timestamp if we didn't have one already
                 times = ['dns_start', 'dns_end',
@@ -685,6 +691,11 @@ class Trace():
                             if time_name in request:
                                 request[time_name] = \
                                         float(request[time_name] - self.start_time) / 1000.0
+                        for key in ['chunks', 'chunks_in', 'chunks_out']:
+                            if key in request:
+                                for chunk in request[key]:
+                                    if 'ts' in chunk:
+                                        chunk['ts'] = float(chunk['ts'] - self.start_time) / 1000.0
                 else:
                     requests = []
         if not len(requests):
@@ -865,10 +876,20 @@ class Trace():
             parent_id = params['source_dependency']['id']
             if 'connect_job' in self.netlog and parent_id in self.netlog['connect_job']:
                 self.netlog['connect_job'][parent_id]['dns'] = request_id
+        if name == 'HOST_RESOLVER_IMPL_REQUEST' and 'ph' in trace_event:
+            if trace_event['ph'] == 'b':
+                if 'start' not in entry or trace_event['ts'] < entry['start']:
+                    entry['start'] = trace_event['ts']
+            if trace_event['ph'] == 'e':
+                if 'end' not in entry or trace_event['ts'] > entry['end']:
+                    entry['end'] = trace_event['ts']
         if 'start' not in entry and name == 'HOST_RESOLVER_IMPL_ATTEMPT_STARTED':
             entry['start'] = trace_event['ts']
         if name == 'HOST_RESOLVER_IMPL_ATTEMPT_FINISHED':
             entry['end'] = trace_event['ts']
+        if name == 'HOST_RESOLVER_IMPL_CACHE_HIT':
+            if 'end' not in entry or trace_event['ts'] > entry['end']:
+                entry['end'] = trace_event['ts']
         if 'host' not in entry and 'host' in params:
             entry['host'] = params['host']
         if 'address_list' in params:
@@ -944,6 +965,7 @@ class Trace():
                 entry['first_byte'] = trace_event['ts']
             entry['end'] = trace_event['ts']
         if 'byte_count' in params and name == 'URL_REQUEST_JOB_BYTES_READ':
+            entry['has_raw_bytes'] = True
             entry['end'] = trace_event['ts']
             entry['bytes_in'] += params['byte_count']
             entry['chunks'].append({'ts': trace_event['ts'], 'bytes': params['byte_count']})
@@ -952,6 +974,9 @@ class Trace():
             if 'uncompressed_bytes_in' not in entry:
                 entry['uncompressed_bytes_in'] = 0
             entry['uncompressed_bytes_in'] += params['byte_count']
+            if 'has_raw_bytes' not in entry or not entry['has_raw_bytes']:
+                entry['bytes_in'] += params['byte_count']
+                entry['chunks'].append({'ts': trace_event['ts'], 'bytes': params['byte_count']})
         if 'stream_id' in params:
             entry['stream_id'] = params['stream_id']
         if name == 'URL_REQUEST_REDIRECTED':
@@ -3237,7 +3262,103 @@ BLINK_FEATURES = {
     "2508": "CSSFillAvailableLogicalHeight",
     "2509": "PopupOpenWhileFileChooserOpened",
     "2510": "CookieStoreAPI",
-    "2511": "FeaturePolicyJSAPI"
+    "2511": "FeaturePolicyJSAPI",
+    "2512": "V8RTCPeerConnection_GetTransceivers_Method",
+    "2513": "V8RTCPeerConnection_AddTransceiver_Method",
+    "2514": "V8RTCRtpTransceiver_Direction_AttributeGetter",
+    "2515": "V8RTCRtpTransceiver_Direction_AttributeSetter",
+    "2516": "HTMLLinkElementDisabledByParser",
+    "2517": "RequestIsHistoryNavigation",
+    "2518": "AddDocumentLevelPassiveTrueWheelEventListener",
+    "2519": "AddDocumentLevelPassiveFalseWheelEventListener",
+    "2520": "AddDocumentLevelPassiveDefaultWheelEventListener",
+    "2521": "DocumentLevelPassiveDefaultEventListenerPreventedWheel",
+    "2522": "ShapeDetectionAPI",
+    "2523": "V8SourceBuffer_ChangeType_Method",
+    "2524": "PPAPIWebSocket",
+    "2525": "V8MediaStreamTrack_ContentHint_AttributeGetter",
+    "2526": "V8MediaStreamTrack_ContentHint_AttributeSetter",
+    "2527": "V8IDBFactory_Open_Method",
+    "2528": "EvaluateScriptMovedBetweenDocuments",
+    "2529": "ReportingObserver",
+    "2530": "DeprecationReport",
+    "2531": "InterventionReport",
+    "2532": "V8WasmSharedMemory",
+    "2533": "V8WasmThreadOpcodes",
+    "2534": "CacheStorageAddAllSuccessWithDuplicate",
+    "2535": "LegendDelegateFocusOrAccessKey",
+    "2536": "FeaturePolicyReport",
+    "2537": "V8Window_WebkitRTCPeerConnection_ConstructorGetter",
+    "2538": "V8Window_WebkitMediaStream_ConstructorGetter",
+    "2539": "TextEncoderStreamConstructor",
+    "2540": "TextDecoderStreamConstructor",
+    "2541": "SignedExchangeInnerResponse",
+    "2542": "PaymentAddressLanguageCode",
+    "2543": "DocumentDomainBlockedCrossOriginAccess",
+    "2544": "DocumentDomainEnabledCrossOriginAccess",
+    "2545": "SerialGetPorts",
+    "2546": "SerialRequestPort",
+    "2547": "SerialPortOpen",
+    "2548": "SerialPortClose",
+    "2549": "BackgroundFetchManagerFetch",
+    "2550": "BackgroundFetchManagerGet",
+    "2551": "BackgroundFetchManagerGetIds",
+    "2552": "BackgroundFetchRegistrationAbort",
+    "2553": "BackgroundFetchRegistrationMatch",
+    "2554": "BackgroundFetchRegistrationMatchAll",
+    "2555": "V8AtomicsNotify",
+    "2556": "V8AtomicsWake",
+    "2557": "FormDisabledAttributePresent",
+    "2558": "FormDisabledAttributePresentAndSubmit",
+    "2559": "CSSValueAppearanceCheckboxRendered",
+    "2560": "CSSValueAppearanceCheckboxForOthersRendered",
+    "2561": "CSSValueAppearanceRadioRendered",
+    "2562": "CSSValueAppearanceRadioForOthersRendered",
+    "2563": "CSSValueAppearanceInnerSpinButtonRendered",
+    "2564": "CSSValueAppearanceInnerSpinButtonForOthersRendered",
+    "2565": "CSSValueAppearanceMenuListRendered",
+    "2566": "CSSValueAppearanceMenuListForOthersRendered",
+    "2567": "CSSValueAppearanceProgressBarRendered",
+    "2568": "CSSValueAppearanceSliderHorizontalRendered",
+    "2569": "CSSValueAppearanceSliderHorizontalForOthersRendered",
+    "2570": "CSSValueAppearanceSliderVerticalRendered",
+    "2571": "CSSValueAppearanceSliderVerticalForOthersRendered",
+    "2572": "CSSValueAppearanceSliderThumbHorizontalRendered",
+    "2573": "CSSValueAppearanceSliderThumbHorizontalForOthersRendered",
+    "2574": "CSSValueAppearanceSliderThumbVerticalRendered",
+    "2575": "CSSValueAppearanceSliderThumbVerticalForOthersRendered",
+    "2576": "CSSValueAppearanceSearchFieldRendered",
+    "2577": "CSSValueAppearanceSearchFieldForOthersRendered",
+    "2578": "CSSValueAppearanceSearchCancelRendered",
+    "2579": "CSSValueAppearanceSearchCancelForOthersRendered",
+    "2580": "CSSValueAppearanceTextAreaRendered",
+    "2581": "CSSValueAppearanceTextAreaForOthersRendered",
+    "2582": "CSSValueAppearanceMenuListButtonRendered",
+    "2583": "CSSValueAppearanceMenuListButtonForOthersRendered",
+    "2584": "CSSValueAppearancePushButtonRendered",
+    "2585": "CSSValueAppearancePushButtonForOthersRendered",
+    "2586": "CSSValueAppearanceSquareButtonRendered",
+    "2587": "CSSValueAppearanceSquareButtonForOthersRendered",
+    "2588": "GetComputedStyleForWebkitAppearance",
+    "2589": "CursorImageLE32x32",
+    "2590": "CursorImageGT32x32",
+    "2591": "RTCPeerConnectionComplexPlanBSdpUsingDefaultSdpSemantics",
+    "2592": "ResizeObserver_Constructor",
+    "2593": "Collator",
+    "2594": "NumberFormat",
+    "2595": "DateTimeFormat",
+    "2596": "PluralRules",
+    "2597": "RelativeTimeFormat",
+    "2598": "Locale",
+    "2599": "ListFormat",
+    "2600": "Segmenter",
+    "2601": "StringLocaleCompare",
+    "2602": "StringToLocaleUpperCase",
+    "2603": "StringToLocaleLowerCase",
+    "2604": "NumberToLocaleString",
+    "2605": "DateToLocaleString",
+    "2606": "DateToLocaleDateString",
+    "2607": "DateToLocaleTimeString"
 }
 
 ##########################################################################
