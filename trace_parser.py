@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """
-Copyright 2016 Google Inc. All Rights Reserved.
+Copyright 2019 WebPageTest LLC.
+Copyright 2016 Google Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,8 +20,17 @@ import logging
 import math
 import os
 import re
+import sys
 import time
-import urlparse
+if (sys.version_info > (3, 0)):
+    from urllib.parse import urlparse # pylint: disable=import-error
+    unicode = str
+    GZIP_TEXT = 'wt'
+    GZIP_READ_TEXT = 'rt'
+else:
+    from urlparse import urlparse # pylint: disable=import-error
+    GZIP_TEXT = 'w'
+    GZIP_READ_TEXT = 'r'
 
 # try a fast json parser if it is installed
 try:
@@ -44,11 +54,12 @@ class Trace():
         self.timeline_events = []
         self.trace_events = []
         self.interactive = []
+        self.long_tasks = []
         self.interactive_start = 0
         self.interactive_end = None
         self.start_time = None
         self.end_time = None
-        self.cpu = {'main_thread': None}
+        self.cpu = {'main_thread': None, 'main_threads':[], 'subframes': []}
         self.feature_usage = None
         self.feature_usage_start_time = None
         self.netlog = {'bytes_in': 0, 'bytes_out': 0, 'next_request_id': 1000000}
@@ -65,17 +76,19 @@ class Trace():
         try:
             _, ext = os.path.splitext(out_file)
             if ext.lower() == '.gz':
-                with gzip.open(out_file, 'wb') as f:
+                with gzip.open(out_file, GZIP_TEXT) as f:
                     json.dump(json_data, f)
             else:
                 with open(out_file, 'w') as f:
                     json.dump(json_data, f)
         except BaseException:
-            logging.critical("Error writing to " + out_file)
+            logging.exception("Error writing to " + out_file)
 
     def WriteUserTiming(self, out_file):
-        self.user_timing.sort(key=lambda trace_event: trace_event['ts'])
-        self.write_json(out_file, self.user_timing)
+        out = self.post_process_netlog_events()
+        out = self.post_process_user_timing()
+        if out is not None:
+            self.write_json(out_file, out)
 
     def WriteCPUSlices(self, out_file):
         self.write_json(out_file, self.cpu)
@@ -85,10 +98,32 @@ class Trace():
             self.write_json(out_file, self.scripts)
 
     def WriteFeatureUsage(self, out_file):
-        self.write_json(out_file, self.feature_usage)
+        self.post_process_netlog_events()
+        out = self.post_process_feature_usage()
+        if out is not None:
+            self.write_json(out_file, out)
 
     def WriteInteractive(self, out_file):
-        self.write_json(out_file, self.interactive)
+        # Generate the interactive periods from the long-task data
+        if self.end_time and self.start_time:
+            interactive = []
+            end_time = int(math.ceil(float(self.end_time - self.start_time) / 1000.0))
+            if not self.long_tasks:
+                interactive.append([0, end_time])
+            else:
+                last_end = 0
+                for task in self.long_tasks:
+                    elapsed = task[0] - last_end
+                    if elapsed > 0:
+                        interactive.append([last_end, task[0]])
+                    last_end = task[1]
+                elapsed = end_time - last_end
+                if elapsed > 0:
+                    interactive.append([last_end, end_time])
+            self.write_json(out_file, interactive)
+    
+    def WriteLongTasks(self, out_file):
+        self.write_json(out_file, self.long_tasks)
 
     def WriteNetlog(self, out_file):
         out = self.post_process_netlog_events()
@@ -97,6 +132,8 @@ class Trace():
 
     def WriteV8Stats(self, out_file):
         if self.v8stats is not None:
+            self.v8stats["main_thread"] = self.cpu['main_thread']
+            self.v8stats["main_threads"] = self.cpu['main_threads']
             self.write_json(out_file, self.v8stats)
 
     ##########################################################################
@@ -108,9 +145,9 @@ class Trace():
         self.__init__()
         logging.debug("Loading trace: %s", trace)
         try:
-            file_name, ext = os.path.splitext(trace)
+            _, ext = os.path.splitext(trace)
             if ext.lower() == '.gz':
-                f = gzip.open(trace, 'rb')
+                f = gzip.open(trace, GZIP_READ_TEXT)
             else:
                 f = open(trace, 'r')
             for line in f:
@@ -123,9 +160,9 @@ class Trace():
                         line_mode = True
                         self.FilterTraceEvent(trace_event)
                 except BaseException:
-                    pass
+                    logging.exception('Error processing trace line')
         except BaseException:
-            logging.critical("Error processing trace " + trace)
+            logging.exception("Error processing trace " + trace)
         if f is not None:
             f.close()
         self.ProcessTraceEvents()
@@ -137,9 +174,9 @@ class Trace():
         events = None
         f = None
         try:
-            file_name, ext = os.path.splitext(timeline)
+            _, ext = os.path.splitext(timeline)
             if ext.lower() == '.gz':
-                f = gzip.open(timeline, 'rb')
+                f = gzip.open(timeline, GZIP_READ_TEXT)
             else:
                 f = open(timeline, 'r')
             events = json.load(f)
@@ -166,7 +203,7 @@ class Trace():
                                     self.timeline_events.append(e)
                 self.ProcessTimelineEvents()
         except BaseException:
-            logging.critical("Error processing timeline " + timeline)
+            logging.exception("Error processing timeline " + timeline)
         if f is not None:
             f.close()
 
@@ -175,6 +212,7 @@ class Trace():
         if cat == 'toplevel' or cat == 'ipc,toplevel':
             return
         if cat == 'devtools.timeline' or \
+                cat == '__metadata' or \
                 cat.find('devtools.timeline') >= 0 or \
                 cat.find('blink.feature_usage') >= 0 or \
                 cat.find('blink.user_timing') >= 0 or \
@@ -201,14 +239,19 @@ class Trace():
         # Do the post-processing on timeline events
         logging.debug("Processing timeline events")
         self.ProcessTimelineEvents()
-        logging.debug("Done processing trace events")
+        logging.debug("Done processing trace events")      
 
     def ProcessTraceEvent(self, trace_event):
         cat = trace_event['cat']
         if cat.find('blink.user_timing') >= 0 or cat.find('rail') >= 0 or \
                 cat.find('loading') >= 0 or cat.find('navigation') >= 0:
             keep = False
-            if 'args' in trace_event and 'frame' in trace_event['args']:
+            if 'args' in trace_event and \
+                    'data' in trace_event['args'] and \
+                    'inMainFrame' in trace_event['args']['data'] and \
+                    trace_event['args']['data']['inMainFrame']:
+                keep = True
+            elif 'args' in trace_event and 'frame' in trace_event['args']:
                 keep = True
             elif 'name' in trace_event and trace_event['name'] in [
                     'navigationStart', 'unloadEventStart', 'redirectStart', 'domLoading']:
@@ -218,20 +261,108 @@ class Trace():
             if 'name' in trace_event and trace_event['name'].find('navigationStart') >= 0:
                 if self.start_time is None or trace_event['ts'] < self.start_time:
                     self.start_time = trace_event['ts']
+            if self.cpu['main_thread'] is None and 'name' in trace_event and \
+                    trace_event['name'] in ['navigationStart', 'fetchStart']:
+                thread = '{0}:{1}'.format(trace_event['pid'], trace_event['tid'])
+                self.cpu['main_thread'] = thread
+                if thread not in self.cpu['main_threads']:
+                    self.cpu['main_threads'].append(thread)
+            if 'args' in trace_event and \
+                    'data' in trace_event['args'] and \
+                    'inMainFrame' in trace_event['args']['data'] and \
+                    trace_event['args']['data']['inMainFrame']:
+                thread = '{0}:{1}'.format(trace_event['pid'], trace_event['tid'])
+                if thread not in self.cpu['main_threads']:
+                    self.cpu['main_threads'].append(thread)
+        if cat == '__metadata' and 'name' in trace_event and \
+                trace_event['name'] == 'process_labels' and \
+                'pid' in trace_event and 'args' in trace_event and \
+                'labels' in trace_event['args'] and \
+                trace_event['args']['labels'].startswith('Subframe:'):
+            self.cpu['subframes'].append(str(trace_event['pid']))
+        if cat == '__metadata' and 'name' in trace_event and \
+                trace_event['name'] == 'thread_name' and \
+                'args' in trace_event and \
+                'name' in trace_event['args'] and \
+                trace_event['args']['name'] == 'CrRendererMain':
+            thread = '{0}:{1}'.format(trace_event['pid'], trace_event['tid'])
+            if thread not in self.cpu['main_threads']:
+                self.cpu['main_threads'].append(thread)
         if cat == 'netlog' or cat.find('netlog') >= 0:
             self.ProcessNetlogEvent(trace_event)
         elif cat == 'devtools.timeline' or cat.find('devtools.timeline') >= 0:
             self.ProcessTimelineTraceEvent(trace_event)
         elif cat.find('blink.feature_usage') >= 0:
             self.ProcessFeatureUsageEvent(trace_event)
-        elif cat.find('v8') >= 0:
+        if cat.find('v8') >= 0:
             self.ProcessV8Event(trace_event)
+    
+    def post_process_user_timing(self):
+        out = None
+        if self.user_timing is not None:
+            self.user_timing.sort(key=lambda trace_event: trace_event['ts'])
+            out = []
+            candidates = {}
+            lcp_event = None
+            for event in self.user_timing:
+                try:
+                    consumed = False
+                    if event['cat'].find('loading') >= 0 and 'name' in event:
+                        if event['name'].startswith('NavStartToLargestContentfulPaint'):
+                            consumed = True
+                            if event['name'].find('Invalidate') >= 0:
+                                lcp_event = None
+                            elif event['name'].find('Candidate') >= 0:
+                                lcp_event = dict(event)
+                        elif event['name'].find('::') >= 0:
+                            consumed = True
+                            (name, trigger) = event['name'].split('::', 1)
+                            name = name[:1].upper() + name[1:]
+                            event['name'] = name
+                            key = name
+                            try:
+                                if 'args' in event:
+                                    if 'frame' in event['args']:
+                                        key += ':' + event['args']['frame']
+                                    if 'data' in event['args'] and 'candidateIndex' in event['args']['data']:
+                                        if isinstance(event['args']['data']['candidateIndex'], int):
+                                            key += '.{0:d}'.format(event['args']['data']['candidateIndex'])
+                                        elif isinstance(event['args']['data']['candidateIndex'], str):
+                                            key += '.' + event['args']['data']['candidateIndex']
+                            except Exception:
+                                logging.exception('Error processing user timing event key')
+                            if trigger == 'Candidate':
+                                candidates[key] = dict(event)
+                            elif trigger == 'Invalidate' and key in candidates:
+                                del candidates[key]
+                    if not consumed:
+                        out.append(event)
+                except Exception:
+                    logging.exception('Error processing user timing event')
+            has_lcp = False
+            for name in candidates:
+                if name.startswith('LargestContentfulPaint'):
+                    has_lcp = True
+                    break
+            if lcp_event is not None and not has_lcp:
+                lcp_event['name'] = 'LargestContentfulPaint'
+                out.append(lcp_event)
+            for name in candidates:
+                out.append(candidates[name])
+            out.append({'startTime': self.start_time})
+        return out
 
     ##########################################################################
     #   Timeline
     ##########################################################################
     def ProcessTimelineTraceEvent(self, trace_event):
         thread = '{0}:{1}'.format(trace_event['pid'], trace_event['tid'])
+        if trace_event['name'] == 'thread_name' and \
+                'args' in trace_event and \
+                'name' in trace_event['args'] and \
+                trace_event['args']['name'] == 'CrRendererMain' and \
+                thread not in self.cpu['main_threads']:
+            self.cpu['main_threads'].append(thread)
 
         # Keep track of the main thread
         if 'args' in trace_event and 'data' in trace_event['args'] and \
@@ -249,6 +380,8 @@ class Trace():
                     if self.start_time is None or trace_event['ts'] < self.start_time:
                         self.start_time = trace_event['ts']
                     self.cpu['main_thread'] = thread
+                    if thread not in self.cpu['main_threads']:
+                        self.cpu['main_threads'].append(thread)
                     if 'dur' not in trace_event:
                         trace_event['dur'] = 1
 
@@ -408,7 +541,28 @@ class Trace():
                             int(self.cpu['slices'][thread][name]
                                 [slice] * self.cpu['slice_usecs'])
 
-    def ProcessTimelineEvent(self, timeline_event, parent, stack = None):
+            # Pick the candidate main thread with the most activity
+            main_threads = list(self.cpu['main_threads'])
+            if len(main_threads) == 0:
+                main_threads = self.cpu['slices'].keys()
+            main_thread = None
+            main_thread_cpu = 0
+            for thread in main_threads:
+                try:
+                    thread_cpu = 0
+                    if thread in self.cpu['slices']:
+                        for name in self.cpu['slices'][thread].keys():
+                            for slice in range(len(self.cpu['slices'][thread][name])):
+                                thread_cpu += self.cpu['slices'][thread][name][slice]
+                        if main_thread is None or thread_cpu > main_thread_cpu:
+                            main_thread = thread
+                            main_thread_cpu = thread_cpu
+                except Exception:
+                    logging.exception('Error processing thread')
+            if main_thread is not None:
+                self.cpu['main_thread'] = main_thread
+
+    def ProcessTimelineEvent(self, timeline_event, parent, stack=None):
         start = timeline_event['s'] - self.start_time
         end = timeline_event['e'] - self.start_time
         if stack is None:
@@ -430,6 +584,28 @@ class Trace():
                     self.interactive_end = None
                 else:
                     self.interactive_end = end
+            
+            # Keep track of the long-duration top-level tasks
+            if parent is None and elapsed > 50000 and thread in self.cpu['main_threads']:
+                # make sure this isn't contained within an existing event
+                ms_start = int(math.floor(start / 1000.0))
+                ms_end = int(math.ceil(end / 1000.0))
+                if not self.long_tasks:
+                    # Empty list of long tasks
+                    self.long_tasks.append([ms_start, ms_end])
+                else:
+                    last_start = self.long_tasks[-1][0]
+                    last_end = self.long_tasks[-1][1]
+                    if ms_start >= last_end:
+                        # This task is entirely after the last long task we know about
+                        self.long_tasks.append([ms_start, ms_end])
+                    elif ms_end > last_end:
+                        # task extends beyond the previous end of the long tasks but overlaps
+                        del self.long_tasks[-1]
+                        if ms_start >= last_start:
+                            self.long_tasks.append([last_start, ms_end])
+                        else:
+                            self.long_tasks.append([ms_start, ms_end])
 
             if 'js' in timeline_event:
                 script = timeline_event['js']
@@ -466,7 +642,7 @@ class Trace():
             slice_usecs = self.cpu['slice_usecs']
             first_slice = int(float(start) / float(slice_usecs))
             last_slice = int(float(end) / float(slice_usecs))
-            for slice_number in xrange(first_slice, last_slice + 1):
+            for slice_number in range(first_slice, last_slice + 1):
                 slice_start = slice_number * slice_usecs
                 slice_end = slice_start + slice_usecs
                 used_start = max(slice_start, start)
@@ -511,7 +687,7 @@ class Trace():
                     self.cpu['slices'][thread]['total'][slice_number] = min(
                         1.0, max(0.0, 1.0 - available))
         except BaseException:
-            pass
+            logging.exception('Error adjusting timeline slice')
 
     ##########################################################################
     #   Blink Features
@@ -525,35 +701,48 @@ class Trace():
             if self.feature_usage is None:
                 self.feature_usage = {
                     'Features': {}, 'CSSFeatures': {}, 'AnimatedCSSFeatures': {}}
-            if self.feature_usage_start_time is None:
-                if self.start_time is not None:
-                    self.feature_usage_start_time = self.start_time
-                else:
-                    self.feature_usage_start_time = trace_event['ts']
             id = '{0:d}'.format(trace_event['args']['feature'])
-            timestamp = float('{0:0.3f}'.format(
-                (trace_event['ts'] - self.feature_usage_start_time) / 1000.0))
             if trace_event['name'] == 'FeatureFirstUsed':
                 if id in BLINK_FEATURES:
                     name = BLINK_FEATURES[id]
                 else:
                     name = 'Feature_{0}'.format(id)
-                if name not in self.feature_usage['Features']:
-                    self.feature_usage['Features'][name] = timestamp
+                if id not in self.feature_usage['Features']:
+                    self.feature_usage['Features'][id] = {'name': name, 'firstUsed': []}
+                self.feature_usage['Features'][id]['firstUsed'].append(trace_event['ts'])
             elif trace_event['name'] == 'CSSFirstUsed':
                 if id in CSS_FEATURES:
                     name = CSS_FEATURES[id]
                 else:
                     name = 'CSSFeature_{0}'.format(id)
-                if name not in self.feature_usage['CSSFeatures']:
-                    self.feature_usage['CSSFeatures'][name] = timestamp
+                if id not in self.feature_usage['CSSFeatures']:
+                    self.feature_usage['CSSFeatures'][id] = {'name': name, 'firstUsed': []}
+                self.feature_usage['CSSFeatures'][id]['firstUsed'].append(trace_event['ts'])
             elif trace_event['name'] == 'AnimatedCSSFirstUsed':
                 if id in CSS_FEATURES:
                     name = CSS_FEATURES[id]
                 else:
                     name = 'CSSFeature_{0}'.format(id)
-                if name not in self.feature_usage['AnimatedCSSFeatures']:
-                    self.feature_usage['AnimatedCSSFeatures'][name] = timestamp
+                if id not in self.feature_usage['AnimatedCSSFeatures']:
+                    self.feature_usage['AnimatedCSSFeatures'][id] = {'name': name, 'firstUsed': []}
+                self.feature_usage['AnimatedCSSFeatures'][id]['firstUsed'].append(trace_event['ts'])
+    
+    def post_process_feature_usage(self):
+        out = None
+        if self.feature_usage is not None and self.start_time is not None:
+            out = {}
+            for category in self.feature_usage:
+                out[category] = {}
+                for id in self.feature_usage[category]:
+                    feature_time = None
+                    for ts in self.feature_usage[category][id]['firstUsed']:
+                        timestamp = float('{0:0.3f}'.format((ts - self.start_time) / 1000.0))
+                        if timestamp > 0:
+                            if feature_time is None or timestamp < feature_time:
+                                feature_time = timestamp
+                    if feature_time is not None:
+                        out[category][id] = {'name': self.feature_usage[category][id]['name'], 'firstUsed': feature_time}
+        return out
 
     ##########################################################################
     #   Netlog
@@ -576,12 +765,16 @@ class Trace():
                     self.ProcessNetlogStreamJobEvent(trace_event)
                 elif event_type == 'HTTP2_SESSION':
                     self.ProcessNetlogHttp2SessionEvent(trace_event)
+                elif event_type == 'QUIC_SESSION':
+                    self.ProcessNetlogQuicSessionEvent(trace_event)
                 elif event_type == 'SOCKET':
                     self.ProcessNetlogSocketEvent(trace_event)
+                elif event_type == 'UDP_SOCKET':
+                    self.ProcessNetlogUdpSocketEvent(trace_event)
                 elif event_type == 'URL_REQUEST':
                     self.ProcessNetlogUrlRequestEvent(trace_event)
             except Exception:
-                pass
+                logging.exception('Error processing netlog event')
 
     def post_process_netlog_events(self):
         """Post-process the raw netlog events into request data"""
@@ -592,12 +785,78 @@ class Trace():
             for request_id in self.netlog['url_request']:
                 request = self.netlog['url_request'][request_id]
                 request['fromNet'] = bool('start' in request)
-                if 'url' in request and request['url'][:16] != 'http://127.0.0.1':
+                # build a URL from the request headers if one wasn't explicitly provided
+                if 'url' not in request and 'request_headers' in request:
+                    scheme = None
+                    origin = None
+                    path = None
+                    if 'line' in request:
+                        match = re.search(r'^[^\s]+\s([^\s]+)', request['line'])
+                        if match:
+                            path = match.group(1)
+                    if 'group' in request:
+                        scheme = 'http'
+                        if request['group'].find('ssl/') >= 0:
+                            scheme = 'https'
+                    elif 'socket' in request and 'socket' in self.netlog and request['socket'] in self.netlog['socket']:
+                        socket = self.netlog['socket'][request['socket']]
+                        scheme = 'http'
+                        if 'certificates' in socket or 'ssl_start' in socket:
+                            scheme = 'https'
+                    for header in request['request_headers']:
+                        try:
+                            index = header.find(u':', 1)
+                            if index > 0:
+                                key = header[:index].strip(u': ').lower()
+                                value = header[index + 1:].strip(u': ')
+                                if key == u'scheme':
+                                    scheme = unicode(value)
+                                elif key == u'host':
+                                    origin = unicode(value)
+                                elif key == u'authority':
+                                    origin = unicode(value)
+                                elif key == u'path':
+                                    path = unicode(value)
+                        except Exception:
+                            logging.exception("Error generating url from request headers")
+                    if scheme and origin and path:
+                        request['url'] = scheme + u'://' + origin + path
+                if 'url' in request and not request['url'].startswith('http://127.0.0.1') and \
+                        not request['url'].startswith('http://192.168.10.'):
+                    # Match orphaned request streams with their h2 sessions
+                    if 'stream_id' in request and 'h2_session' not in request and 'url' in request:
+                        request_host = urlparse(request['url']).hostname
+                        for h2_session_id in self.netlog['h2_session']:
+                            h2_session = self.netlog['h2_session'][h2_session_id]
+                            if 'host' in h2_session:
+                                session_host = h2_session['host'].split(':')[0]
+                                if 'stream' in h2_session and \
+                                        request['stream_id'] in h2_session['stream'] and \
+                                        session_host == request_host and \
+                                        'request_headers' in request and \
+                                        'request_headers' in h2_session['stream'][request['stream_id']]:
+                                    # See if the path header matches
+                                    stream = h2_session['stream'][request['stream_id']]
+                                    request_path = None
+                                    stream_path = None
+                                    for header in request['request_headers']:
+                                        if header.startswith(':path:'):
+                                            request_path = header
+                                            break
+                                    for header in stream['request_headers']:
+                                        if header.startswith(':path:'):
+                                            stream_path = header
+                                            break
+                                    if request_path is not None and request_path == stream_path:
+                                        request['h2_session'] = h2_session_id
+                                        break
                     # Copy any http/2 info over
                     if 'h2_session' in self.netlog and \
                             'h2_session' in request and \
                             request['h2_session'] in self.netlog['h2_session']:
                         h2_session = self.netlog['h2_session'][request['h2_session']]
+                        if 'socket' not in request and 'socket' in h2_session:
+                            request['socket'] = h2_session['socket']
                         if 'stream_id' in request and \
                                 'stream' in h2_session and \
                                 request['stream_id'] in h2_session['stream']:
@@ -612,6 +871,17 @@ class Trace():
                                 request['parent_stream_id'] = stream['parent_stream_id']
                             if 'weight' in stream:
                                 request['weight'] = stream['weight']
+                                if 'priority' not in request:
+                                    if request['weight'] >= 256:
+                                        request['priority'] = 'HIGHEST'
+                                    elif request['weight'] >= 220:
+                                        request['priority'] = 'MEDIUM'
+                                    elif request['weight'] >= 183:
+                                        request['priority'] = 'LOW'
+                                    elif request['weight'] >= 147:
+                                        request['priority'] = 'LOWEST'
+                                    else:
+                                        request['priority'] = 'IDLE'
                             if 'first_byte' not in request and 'first_byte' in stream:
                                 request['first_byte'] = stream['first_byte']
                             if 'end' not in request and 'end' in stream:
@@ -619,7 +889,7 @@ class Trace():
                             if stream['bytes_in'] > request['bytes_in']:
                                 request['bytes_in'] = stream['bytes_in']
                                 request['chunks'] = stream['chunks']
-                    if 'phantom' not in request:
+                    if 'phantom' not in request and 'request_headers' in request:
                         requests.append(request)
             if len(requests):
                 # Sort the requests by the start time
@@ -647,6 +917,19 @@ class Trace():
                                     request['ssl_end'] = socket['ssl_end']
                                 if 'certificates' in socket:
                                     request['certificates'] = socket['certificates']
+                                if 'h2_session' in request and request['h2_session'] in self.netlog['h2_session']:
+                                    h2_session = self.netlog['h2_session'][request['h2_session']]
+                                    if 'server_settings' in h2_session:
+                                        request['http2_server_settings'] = h2_session['server_settings']
+                                if 'tls_version' in socket:
+                                    request['tls_version'] = socket['tls_version']
+                                if 'tls_resumed' in socket:
+                                    request['tls_resumed'] = socket['tls_resumed']
+                                if 'tls_next_proto' in socket:
+                                    request['tls_next_proto'] = socket['tls_next_proto']
+                                if 'tls_cipher_suite' in socket:
+                                    request['tls_cipher_suite'] = socket['tls_cipher_suite']
+
                 # Assign the DNS lookup to the first request that connected to the DocumentSetDomain
                 if 'dns' in self.netlog:
                     # Build a mapping of the DNS lookups for each domain
@@ -673,7 +956,7 @@ class Trace():
                     # Go through the requests and assign the DNS lookups as needed
                     for request in requests:
                         if 'connect_start' in request:
-                            hostname = urlparse.urlparse(request['url']).hostname
+                            hostname = urlparse(request['url']).hostname
                             if hostname in dns_lookups and 'claimed' not in dns_lookups[hostname]:
                                 dns = dns_lookups[hostname]
                                 dns['claimed'] = True
@@ -738,6 +1021,8 @@ class Trace():
                         self.netlog['socket'][socket_id]['dns'] = entry['dns']
         if 'group_name' in params:
             entry['group'] = params['group_name']
+        if 'group_id' in params:
+            entry['group'] = params['group_id']
 
     def ProcessNetlogStreamJobEvent(self, trace_event):
         """Strem jobs leank requests to sockets"""
@@ -749,25 +1034,36 @@ class Trace():
         params = trace_event['args']['params'] if 'params' in trace_event['args'] else {}
         entry = self.netlog['stream_job'][request_id]
         name = trace_event['name']
+        if 'group_name' in params:
+            entry['group'] = params['group_name']
+        if 'group_id' in params:
+            entry['group'] = params['group_id']
         if 'source_dependency' in params and 'id' in params['source_dependency']:
             if name == 'SOCKET_POOL_BOUND_TO_SOCKET':
                 socket_id = params['source_dependency']['id']
                 entry['socket'] = socket_id
                 if 'url_request' in entry and entry['urlrequest'] in self.netlog['urlrequest']:
                     self.netlog['urlrequest'][entry['urlrequest']]['socket'] = socket_id
+                    if 'group' in entry:
+                        self.netlog['urlrequest'][entry['urlrequest']]['group'] = entry['group']
             if name == 'HTTP_STREAM_JOB_BOUND_TO_REQUEST':
                 url_request_id = params['source_dependency']['id']
                 entry['url_request'] = url_request_id
                 if url_request_id in self.netlog['url_request']:
                     url_request = self.netlog['url_request'][url_request_id]
+                    if 'group' in entry:
+                        url_request['group'] = entry['group']
                     if 'socket' in entry:
                         url_request['socket'] = entry['socket']
                     if 'h2_session' in entry:
                         url_request['h2_session'] = entry['h2_session']
             if name == 'HTTP2_SESSION_POOL_IMPORTED_SESSION_FROM_SOCKET' or \
-                    name == 'HTTP2_SESSION_POOL_FOUND_EXISTING_SESSION':
+                    name == 'HTTP2_SESSION_POOL_FOUND_EXISTING_SESSION' or \
+                    name == 'HTTP2_SESSION_POOL_FOUND_EXISTING_SESSION_FROM_IP_POOL':
                 h2_session_id = params['source_dependency']['id']
                 entry['h2_session'] = h2_session_id
+                if h2_session_id in self.netlog['h2_session'] and 'socket' in self.netlog['h2_session'][h2_session_id]:
+                    entry['socket'] = self.netlog['h2_session'][h2_session_id]['socket']
                 if 'url_request' in entry and entry['urlrequest'] in self.netlog['urlrequest']:
                     self.netlog['urlrequest'][entry['urlrequest']]['h2_session'] = h2_session_id
 
@@ -816,6 +1112,8 @@ class Trace():
                 stream['bytes_in'] += params['size']
                 stream['chunks'].append({'ts': trace_event['ts'], 'bytes': params['size']})
             if name == 'HTTP2_SESSION_SEND_HEADERS':
+                if 'start' not in stream:
+                    stream['start'] = trace_event['ts']
                 if 'headers' in params:
                     stream['request_headers'] = params['headers']
             if name == 'HTTP2_SESSION_RECV_HEADERS':
@@ -876,6 +1174,60 @@ class Trace():
             stream['url_request'] = request_id
             if 'socket' in entry:
                 request['socket'] = entry['socket']
+        if name == 'HTTP2_SESSION_RECV_SETTING' and 'id' in params and 'value' in params:
+            setting_id = None
+            match = re.search(r'\d+ \((.+)\)', params['id'])
+            if match:
+                setting_id = match.group(1)
+                if 'server_settings' not in entry:
+                    entry['server_settings'] = {}
+                entry['server_settings'][setting_id] = params['value']
+
+    def ProcessNetlogQuicSessionEvent(self, trace_event):
+        """Raw QUIC session information (linked to sockets and requests)"""
+        if 'quic_session' not in self.netlog:
+            self.netlog['quic_session'] = {}
+        session_id = trace_event['id']
+        if session_id not in self.netlog['quic_session']:
+            self.netlog['quic_session'][session_id] = {'stream': {}}
+        params = trace_event['args']['params'] if 'params' in trace_event['args'] else {}
+        entry = self.netlog['quic_session'][session_id]
+        name = trace_event['name']
+        if 'host' not in entry and 'host' in params:
+            entry['host'] = params['host']
+        if 'port' not in entry and 'port' in params:
+            entry['port'] = params['port']
+        if 'version' not in entry and 'version' in params:
+            entry['version'] = params['version']
+        if 'peer_address' not in entry and 'peer_address' in params:
+            entry['peer_address'] = params['peer_address']
+        if 'self_address' not in entry and 'self_address' in params:
+            entry['self_address'] = params['self_address']
+        if name == 'QUIC_SESSION_PACKET_SENT' and 'connect_start' not in entry:
+            entry['connect_start'] = trace_event['ts']
+        if name == 'QUIC_SESSION_VERSION_NEGOTIATED' and 'connect_end' not in entry:
+            entry['connect_end'] = trace_event['ts']
+        if name == 'CERT_VERIFIER_REQUEST' and 'connect_end' in entry:
+            if 'tls_start' not in entry:
+                entry['tls_start'] = entry['connect_end']
+            if 'tls_end' not in entry:
+                entry['tls_end'] = trace_event['ts']
+        if 'quic_stream_id' in params:
+            stream_id = params['quic_stream_id']
+            if stream_id not in entry['stream']:
+                entry['stream'][stream_id] = {'bytes_in': 0, 'chunks': []}
+            stream = entry['stream'][stream_id]
+            if name == 'QUIC_CHROMIUM_CLIENT_STREAM_SEND_REQUEST_HEADERS':
+                if 'start' not in stream:
+                    stream['start'] = trace_event['ts']
+                if 'headers' in params:
+                    stream['request_headers'] = params['headers']
+            if name == 'QUIC_CHROMIUM_CLIENT_STREAM_READ_RESPONSE_HEADERS':
+                if 'first_byte' not in stream:
+                    stream['first_byte'] = trace_event['ts']
+                stream['end'] = trace_event['ts']
+                if 'headers' in params:
+                    stream['response_headers'] = params['headers']
 
     def ProcessNetlogDnsEvent(self, trace_event):
         if 'dns' not in self.netlog:
@@ -928,10 +1280,19 @@ class Trace():
             entry['connect_start'] = trace_event['ts']
         if name == 'TCP_CONNECT_ATTEMPT' and trace_event['ph'] == 'e':
             entry['connect_end'] = trace_event['ts']
-        if 'ssl_start' not in entry and name == 'SSL_CONNECT' and trace_event['ph'] == 'b':
-            entry['ssl_start'] = trace_event['ts']
-        if name == 'SSL_CONNECT' and trace_event['ph'] == 'e':
-            entry['ssl_end'] = trace_event['ts']
+        if name == 'SSL_CONNECT':
+            if 'ssl_start' not in entry and trace_event['ph'] == 'b':
+                entry['ssl_start'] = trace_event['ts']
+            if trace_event['ph'] == 'e':
+                entry['ssl_end'] = trace_event['ts']
+            if 'version' in params:
+                entry['tls_version'] = params['version']
+            if 'is_resumed' in params:
+                entry['tls_resumed'] = params['is_resumed']
+            if 'next_proto' in params:
+                entry['tls_next_proto'] = params['next_proto']
+            if 'cipher_suite' in params:
+                entry['tls_cipher_suite'] = params['cipher_suite']
         if name == 'SOCKET_BYTES_SENT' and 'byte_count' in params:
             entry['bytes_out'] += params['byte_count']
             entry['chunks_out'].append({'ts': trace_event['ts'], 'bytes': params['byte_count']})
@@ -942,6 +1303,32 @@ class Trace():
             if 'certificates' not in entry:
                 entry['certificates'] = []
             entry['certificates'].extend(params['certificates'])
+
+    def ProcessNetlogUdpSocketEvent(self, trace_event):
+        if 'socket' not in self.netlog:
+            self.netlog['socket'] = {}
+        request_id = trace_event['id']
+        if request_id not in self.netlog['socket']:
+            self.netlog['socket'][request_id] = {'bytes_out': 0, 'bytes_in': 0,
+                                                 'chunks_out': [], 'chunks_in': []}
+        params = trace_event['args']['params'] if 'params' in trace_event['args'] else {}
+        entry = self.netlog['socket'][request_id]
+        name = trace_event['name']
+        if name == 'UDP_CONNECT' and 'address' in params:
+            entry['address'] = params['address']
+        if name == 'UDP_LOCAL_ADDRESS' and 'address' in params:
+            entry['source_address'] = params['address']
+        if 'connect_start' not in entry and name == 'UDP_CONNECT' and \
+                trace_event['ph'] == 'b':
+            entry['connect_start'] = trace_event['ts']
+        if name == 'UDP_CONNECT' and trace_event['ph'] == 'e':
+            entry['connect_end'] = trace_event['ts']
+        if name == 'UDP_BYTES_SENT' and 'byte_count' in params:
+            entry['bytes_out'] += params['byte_count']
+            entry['chunks_out'].append({'ts': trace_event['ts'], 'bytes': params['byte_count']})
+        if name == 'UDP_BYTES_RECEIVED' and 'byte_count' in params:
+            entry['bytes_in'] += params['byte_count']
+            entry['chunks_in'].append({'ts': trace_event['ts'], 'bytes': params['byte_count']})
 
     def ProcessNetlogUrlRequestEvent(self, trace_event):
         if 'url_request' not in self.netlog:
@@ -960,11 +1347,14 @@ class Trace():
             entry['method'] = params['method']
         if 'url' in params:
             entry['url'] = params['url'].split('#', 1)[0]
-        if 'start' not in entry and name == 'HTTP_TRANSACTION_SEND_REQUEST' and \
-                trace_event['ph'] == 'e':
+        if 'start' not in entry and name == 'HTTP_TRANSACTION_SEND_REQUEST':
             entry['start'] = trace_event['ts']
         if 'headers' in params and name == 'HTTP_TRANSACTION_SEND_REQUEST_HEADERS':
             entry['request_headers'] = params['headers']
+            if 'line' in params:
+                entry['line'] = params['line']
+            if 'start' not in entry:
+                entry['start'] = trace_event['ts']
         if 'headers' in params and name == 'HTTP_TRANSACTION_HTTP2_SEND_REQUEST_HEADERS':
             if isinstance(params['headers'], dict):
                 entry['request_headers'] = []
@@ -973,6 +1363,22 @@ class Trace():
             else:
                 entry['request_headers'] = params['headers']
             entry['protocol'] = 'HTTP/2'
+            if 'line' in params:
+                entry['line'] = params['line']
+            if 'start' not in entry:
+                entry['start'] = trace_event['ts']
+        if 'headers' in params and name == 'HTTP_TRANSACTION_QUIC_SEND_REQUEST_HEADERS':
+            if isinstance(params['headers'], dict):
+                entry['request_headers'] = []
+                for key in params['headers']:
+                    entry['request_headers'].append('{0}: {1}'.format(key, params['headers'][key]))
+            else:
+                entry['request_headers'] = params['headers']
+            if 'line' in params:
+                entry['line'] = params['line']
+            entry['protocol'] = 'QUIC'
+            if 'start' not in entry:
+                entry['start'] = trace_event['ts']
         if 'headers' in params and name == 'HTTP_TRANSACTION_READ_RESPONSE_HEADERS':
             entry['response_headers'] = params['headers']
             if 'first_byte' not in entry:
@@ -1022,30 +1428,25 @@ class Trace():
                     elif trace_event['ph'] == 'X' and 'dur' in trace_event:
                         duration = trace_event['dur']
                     if self.v8stats is None:
-                        self.v8stats = {"main_thread": self.cpu['main_thread']}
-                    if thread not in self.v8stats:
-                        self.v8stats[thread] = {}
+                        self.v8stats = {'threads': {}}
+                    if thread not in self.v8stats['threads']:
+                        self.v8stats['threads'][thread] = {}
                     name = trace_event["name"]
-                    if name == "V8.RuntimeStats":
-                        name = "V8.ParseOnBackground"
-
-                    if name not in self.v8stats[thread]:
-                        self.v8stats[thread][name] = {"dur": 0.0, "events": {}}
-                    self.v8stats[thread][name]['dur'] += float(
-                        duration) / 1000.0
+                    if name not in self.v8stats['threads'][thread]:
+                        self.v8stats['threads'][thread][name] = {"dur": 0.0, "count": 0}
+                    self.v8stats['threads'][thread][name]['dur'] += float(duration) / 1000.0
+                    self.v8stats['threads'][thread][name]['count'] += 1
                     if 'args' in trace_event and 'runtime-call-stats' in trace_event["args"]:
                         for stat in trace_event["args"]["runtime-call-stats"]:
-                            if len(trace_event["args"]
-                                   ["runtime-call-stats"][stat]) == 2:
-                                if stat not in self.v8stats[thread][name]['events']:
-                                    self.v8stats[thread][name]['events'][stat] = {
-                                        "count": 0, "dur": 0.0}
-                                self.v8stats[thread][name]['events'][stat]["count"] += int(
-                                    trace_event["args"]["runtime-call-stats"][stat][0])
-                                self.v8stats[thread][name]['events'][stat]["dur"] += float(
-                                    trace_event["args"]["runtime-call-stats"][stat][1]) / 1000.0
+                            if len(trace_event["args"]["runtime-call-stats"][stat]) == 2:
+                                if 'breakdown' not in self.v8stats['threads'][thread][name]:
+                                    self.v8stats['threads'][thread][name]['breakdown'] = {}
+                                if stat not in self.v8stats['threads'][thread][name]['breakdown']:
+                                    self.v8stats['threads'][thread][name]['breakdown'][stat] = {"count": 0, "dur": 0.0}
+                                self.v8stats['threads'][thread][name]['breakdown'][stat]["count"] += int(trace_event["args"]["runtime-call-stats"][stat][0])
+                                self.v8stats['threads'][thread][name]['breakdown'][stat]["dur"] += float(trace_event["args"]["runtime-call-stats"][stat][1]) / 1000.0
         except BaseException:
-            pass
+            logging.exception('Error processing V8 event')
 
 
 ##########################################################################
@@ -1068,9 +1469,10 @@ def main():
                         help="Output blink feature usage file.")
     parser.add_argument('-i', '--interactive',
                         help="Output list of interactive times.")
+    parser.add_argument('-x', '--longtasks', help="Output list of long main thread task times.")
     parser.add_argument('-n', '--netlog', help="Output netlog details file.")
     parser.add_argument('-s', '--stats', help="Output v8 Call stats file.")
-    options, unknown = parser.parse_known_args()
+    options, _ = parser.parse_known_args()
 
     # Set up logging
     log_level = logging.CRITICAL
@@ -1109,6 +1511,9 @@ def main():
 
     if options.interactive:
         trace.WriteInteractive(options.interactive)
+    
+    if options.longtasks:
+        trace.WriteLongTasks(options.longtasks)
 
     if options.netlog:
         trace.WriteNetlog(options.netlog)
@@ -1122,7 +1527,7 @@ def main():
 
 
 ##########################################################################
-#   Blink feature names from https://cs.chromium.org/chromium/src/third_party/blink/public/platform/web_feature.mojom
+#   Blink feature names from https://cs.chromium.org/chromium/src/third_party/blink/public/mojom/web_feature/web_feature.mojom
 ##########################################################################
 BLINK_FEATURES = {
     "0": "PageDestruction",
@@ -3372,11 +3777,564 @@ BLINK_FEATURES = {
     "2604": "NumberToLocaleString",
     "2605": "DateToLocaleString",
     "2606": "DateToLocaleDateString",
-    "2607": "DateToLocaleTimeString"
+    "2607": "DateToLocaleTimeString",
+    "2608": "MalformedCSP",
+    "2609": "V8AttemptOverrideReadOnlyOnPrototypeSloppy",
+    "2610": "V8AttemptOverrideReadOnlyOnPrototypeStrict",
+    "2611": "HTMLCanvasElementLowLatency",
+    "2612": "V8OptimizedFunctionWithOneShotBytecode",
+    "2613": "SVGGeometryPropertyHasNonZeroUnitlessValue",
+    "2614": "CSSValueAppearanceNoImplementationSkipBorder",
+    "2615": "InstantiateModuleScript",
+    "2616": "DynamicImportModuleScript",
+    "2617": "HistoryPushState",
+    "2618": "HistoryReplaceState",
+    "2619": "GetDisplayMedia",
+    "2620": "CursorImageGT64x64",
+    "2621": "AdClick",
+    "2622": "UpdateWithoutShippingOptionOnShippingAddressChange",
+    "2623": "UpdateWithoutShippingOptionOnShippingOptionChange",
+    "2624": "CSSSelectorEmptyWhitespaceOnlyFail",
+    "2625": "ActivatedImplicitRootScroller",
+    "2626": "CSSUnknownNamespacePrefixInSelector",
+    "2627": "PageLifeCycleFreeze",
+    "2628": "DefaultInCustomIdent",
+    "2629": "HTMLAnchorElementHrefTranslateAttribute",
+    "2630": "WebKitUserModifyEffective",
+    "2631": "PlainTextEditingEffective",
+    "2632": "NavigationDownloadInSandboxWithUserGesture",
+    "2633": "NavigationDownloadInSandboxWithoutUserGesture",
+    "2634": "LegacyTLSVersionInMainFrameResource",
+    "2635": "LegacyTLSVersionInSubresource",
+    "2636": "LegacyTLSVersionInSubframeMainResource",
+    "2637": "RTCMaxAudioBufferSize",
+    "2638": "WebKitUserModifyReadWriteEffective",
+    "2639": "WebKitUserModifyReadOnlyEffective",
+    "2640": "WebKitUserModifyPlainTextEffective",
+    "2641": "CSSAtRuleFontFeatureValues",
+    "2642": "FlexboxSingleLineAlignContent",
+    "2643": "SignedExchangeInnerResponseInMainFrame",
+    "2644": "SignedExchangeInnerResponseInSubFrame",
+    "2645": "CSSSelectorNotWithValidList",
+    "2646": "CSSSelectorNotWithInvalidList",
+    "2647": "CSSSelectorNotWithPartiallyValidList",
+    "2648": "V8IDBFactory_Databases_Method",
+    "2649": "OpenerNavigationDownloadCrossOriginNoGesture",
+    "2650": "V8RegExpMatchIsTrueishOnNonJSRegExp",
+    "2651": "V8RegExpMatchIsFalseishOnJSRegExp",
+    "2652": "DownloadInAdFrameWithUserGesture",
+    "2653": "DownloadInAdFrameWithoutUserGesture",
+    "2654": "NavigatorAppVersion",
+    "2655": "NavigatorDoNotTrack",
+    "2656": "NavigatorHardwareConcurrency",
+    "2657": "NavigatorLanguage",
+    "2658": "NavigatorLanguages",
+    "2659": "NavigatorMaxTouchPoints",
+    "2660": "NavigatorMimeTypes",
+    "2661": "NavigatorPlatform",
+    "2662": "NavigatorPlugins",
+    "2663": "NavigatorUserAgent",
+    "2664": "WebBluetoothRequestScan",
+    "2665": "V8SVGGeometryElement_IsPointInFill_Method",
+    "2666": "V8SVGGeometryElement_IsPointInStroke_Method",
+    "2667": "V8SVGGeometryElement_GetTotalLength_Method",
+    "2668": "V8SVGGeometryElement_GetPointAtLength_Method",
+    "2669": "OffscreenCanvasTransferToImageBitmap",
+    "2670": "OffscreenCanvasIsPointInPath",
+    "2671": "OffscreenCanvasIsPointInStroke",
+    "2672": "OffscreenCanvasMeasureText",
+    "2673": "OffscreenCanvasGetImageData",
+    "2674": "V8SVGTextContentElement_GetComputedTextLength_Method",
+    "2675": "V8SVGTextContentElement_GetEndPositionOfChar_Method",
+    "2676": "V8SVGTextContentElement_GetExtentOfChar_Method",
+    "2677": "V8SVGTextContentElement_GetStartPositionOfChar_Method",
+    "2678": "V8SVGTextContentElement_GetSubStringLength_Method",
+    "2679": "V8BatteryManager_ChargingTime_AttributeGetter",
+    "2680": "V8BatteryManager_Charging_AttributeGetter",
+    "2681": "V8BatteryManager_DischargingTime_AttributeGetter",
+    "2682": "V8BatteryManager_Level_AttributeGetter",
+    "2683": "V8PaintRenderingContext2D_IsPointInPath_Method",
+    "2684": "V8PaintRenderingContext2D_IsPointInStroke_Method",
+    "2685": "V8PaymentRequest_CanMakePayment_Method",
+    "2686": "V8AnalyserNode_GetByteFrequencyData_Method",
+    "2687": "V8AnalyserNode_GetByteTimeDomainData_Method",
+    "2688": "V8AnalyserNode_GetFloatFrequencyData_Method",
+    "2689": "V8AnalyserNode_GetFloatTimeDomainData_Method",
+    "2690": "V8AudioBuffer_CopyFromChannel_Method",
+    "2691": "V8AudioBuffer_GetChannelData_Method",
+    "2692": "WebGLDebugRendererInfo",
+    "2693": "V8WebGL2ComputeRenderingContext_GetExtension_Method",
+    "2694": "V8WebGL2ComputeRenderingContext_GetSupportedExtensions_Method",
+    "2695": "V8WebGL2RenderingContext_GetExtension_Method",
+    "2696": "V8WebGL2RenderingContext_GetSupportedExtensions_Method",
+    "2697": "V8WebGLRenderingContext_GetExtension_Method",
+    "2698": "V8WebGLRenderingContext_GetSupportedExtensions_Method",
+    "2699": "V8Screen_AvailHeight_AttributeGetter",
+    "2700": "V8Screen_AvailWidth_AttributeGetter",
+    "2701": "V8Screen_ColorDepth_AttributeGetter",
+    "2702": "V8Screen_Height_AttributeGetter",
+    "2703": "V8Screen_PixelDepth_AttributeGetter",
+    "2704": "V8Screen_Width_AttributeGetter",
+    "2705": "WindowInnerWidth",
+    "2706": "WindowInnerHeight",
+    "2707": "V8Window_MatchMedia_Method",
+    "2708": "WindowScrollX",
+    "2709": "WindowScrollY",
+    "2710": "WindowPageXOffset",
+    "2711": "WindowPageYOffset",
+    "2712": "WindowScreenX",
+    "2713": "WindowScreenY",
+    "2714": "WindowOuterHeight",
+    "2715": "WindowOuterWidth",
+    "2716": "WindowDevicePixelRatio",
+    "2717": "CanvasCaptureStream",
+    "2718": "V8HTMLMediaElement_CanPlayType_Method",
+    "2719": "HistoryLength",
+    "2720": "FeaturePolicyReportOnlyHeader",
+    "2721": "V8PaymentRequest_HasEnrolledInstrument_Method",
+    "2722": "TrustedTypesEnabled",
+    "2723": "TrustedTypesCreatePolicy",
+    "2724": "TrustedTypesDefaultPolicyUsed",
+    "2725": "TrustedTypesAssignmentError",
+    "2726": "BadgeSet",
+    "2727": "BadgeClear",
+    "2728": "ElementTimingExplicitlyRequested",
+    "2729": "V8HTMLMediaElement_CaptureStream_Method",
+    "2730": "QuirkyLineBoxBackgroundSize",
+    "2731": "DirectlyCompositedImage",
+    "2732": "ForbiddenSyncXhrInPageDismissal",
+    "2733": "V8HTMLVideoElement_AutoPictureInPicture_AttributeGetter",
+    "2734": "V8HTMLVideoElement_AutoPictureInPicture_AttributeSetter",
+    "2735": "AutoPictureInPictureAttribute",
+    "2736": "RTCAudioJitterBufferRtxHandling",
+    "2737": "WebShareCanShare",
+    "2738": "PriorityHints",
+    "2739": "TextAutosizedCrossSiteIframe",
+    "2740": "V8RTCQuicTransport_Constructor",
+    "2741": "V8RTCQuicTransport_Transport_AttributeGetter",
+    "2742": "V8RTCQuicTransport_State_AttributeGetter",
+    "2743": "V8RTCQuicTransport_GetKey_Method",
+    "2744": "V8RTCQuicTransport_GetStats_Method",
+    "2745": "V8RTCQuicTransport_Connect_Method",
+    "2746": "V8RTCQuicTransport_Listen_Method",
+    "2747": "V8RTCQuicTransport_Stop_Method",
+    "2748": "V8RTCQuicTransport_CreateStream_Method",
+    "2749": "V8RTCIceTransport_Constructor",
+    "2750": "V8RTCIceTransport_Role_AttributeGetter",
+    "2751": "V8RTCIceTransport_State_AttributeGetter",
+    "2752": "V8RTCIceTransport_GatheringState_AttributeGetter",
+    "2753": "V8RTCIceTransport_GetLocalCandidates_Method",
+    "2754": "V8RTCIceTransport_GetRemoteCandidates_Method",
+    "2755": "V8RTCIceTransport_GetSelectedCandidatePair_Method",
+    "2756": "V8RTCIceTransport_GetLocalParameters_Method",
+    "2757": "V8RTCIceTransport_GetRemoteParameters_Method",
+    "2758": "V8RTCQuicStream_Transport_AttributeGetter",
+    "2759": "V8RTCQuicStream_State_AttributeGetter",
+    "2760": "V8RTCQuicStream_ReadBufferedAmount_AttributeGetter",
+    "2761": "V8RTCQuicStream_MaxReadBufferedAmount_AttributeGetter",
+    "2762": "V8RTCQuicStream_WriteBufferedAmount_AttributeGetter",
+    "2763": "V8RTCQuicStream_MaxWriteBufferedAmount_AttributeGetter",
+    "2764": "V8RTCQuicStream_ReadInto_Method",
+    "2765": "V8RTCQuicStream_Write_Method",
+    "2766": "V8RTCQuicStream_Reset_Method",
+    "2767": "V8RTCQuicStream_WaitForWriteBufferedAmountBelow_Method",
+    "2768": "V8RTCQuicStream_WaitForReadable_Method",
+    "2769": "HTMLTemplateElement",
+    "2770": "NoSysexWebMIDIWithoutPermission",
+    "2771": "NoSysexWebMIDIOnInsecureOrigin",
+    "2772": "ApplicationCacheInstalledButNoManifest",
+    "2773": "PerMethodCanMakePaymentQuota",
+    "2774": "CSSValueAppearanceButtonForNonButtonRendered",
+    "2775": "CSSValueAppearanceButtonForOthersRendered",
+    "2776": "CustomCursorIntersectsViewport",
+    "2777": "ClientHintsLang",
+    "2778": "LinkRelPreloadImageSrcset",
+    "2779": "V8HTMLMediaElement_Remote_AttributeGetter",
+    "2780": "V8RemotePlayback_WatchAvailability_Method",
+    "2781": "V8RemotePlayback_Prompt_Method",
+    "2782": "LayoutJankExplicitlyRequested",
+    "2783": "MediaSessionSkipAd",
+    "2784": "AdFrameSizeIntervention",
+    "2785": "V8UserActivation_HasBeenActive_AttributeGetter",
+    "2786": "V8UserActivation_IsActive_AttributeGetter",
+    "2787": "TextEncoderEncodeInto",
+    "2788": "InvalidBasicCardMethodData",
+    "2789": "ClientHintsUA",
+    "2790": "ClientHintsUAArch",
+    "2791": "ClientHintsUAPlatform",
+    "2792": "ClientHintsUAModel",
+    "2793": "AnimationFrameCancelledWithinFrame",
+    "2794": "SchedulingIsInputPending",
+    "2795": "V8StringNormalize",
+    "2796": "CSSValueAppearanceButtonBevel",
+    "2797": "CSSValueAppearanceListitem",
+    "2798": "CSSValueAppearanceMediaControlsBackground",
+    "2799": "CSSValueAppearanceMediaControlsFullscreenBackground",
+    "2800": "CSSValueAppearanceMediaCurrentTimeDisplay",
+    "2801": "CSSValueAppearanceMediaEnterFullscreenButton",
+    "2802": "CSSValueAppearanceMediaExitFullscreenButton",
+    "2803": "CSSValueAppearanceMediaMuteButton",
+    "2804": "CSSValueAppearanceMediaOverlayPlayButton",
+    "2805": "CSSValueAppearanceMediaPlayButton",
+    "2806": "CSSValueAppearanceMediaTimeRemainingDisplay",
+    "2807": "CSSValueAppearanceMediaToggleClosedCaptionsButton",
+    "2808": "CSSValueAppearanceMediaVolumeSliderContainer",
+    "2809": "CSSValueAppearanceMenulistTextfield",
+    "2810": "CSSValueAppearanceMenulistText",
+    "2811": "CSSValueAppearanceProgressBarValue",
+    "2812": "U2FCryptotokenRegister",
+    "2813": "U2FCryptotokenSign",
+    "2814": "CSSValueAppearanceInnerSpinButton",
+    "2815": "CSSValueAppearanceMeter",
+    "2816": "CSSValueAppearanceProgressBar",
+    "2817": "CSSValueAppearanceProgressBarForOthersRendered",
+    "2818": "CSSValueAppearancePushButton",
+    "2819": "CSSValueAppearanceSquareButton",
+    "2820": "CSSValueAppearanceSearchCancel",
+    "2821": "CSSValueAppearanceTextarea",
+    "2822": "CSSValueAppearanceTextFieldForOthersRendered",
+    "2823": "CSSValueAppearanceTextFieldForTemporalRendered",
+    "2824": "BuiltInModuleKvStorage",
+    "2825": "BuiltInModuleVirtualScroller",
+    "2826": "AdClickNavigation",
+    "2827": "RTCStatsRelativePacketArrivalDelay",
+    "2829": "CSSSelectorHostContextInSnapshotProfile",
+    "2830": "CSSSelectorHostContextInLiveProfile",
+    "2831": "ImportMap",
+    "2832": "RefreshHeader",
+    "2833": "SearchEventFired",
+    "2834": "IdleDetectionStart",
+    "2835": "TargetCurrent",
+    "2836": "SandboxBackForwardStaysWithinSubtree",
+    "2837": "SandboxBackForwardAffectsFramesOutsideSubtree",
+    "2838": "DownloadPrePolicyCheck",
+    "2839": "DownloadPostPolicyCheck",
+    "2840": "DownloadInSandboxWithoutUserGesture",
+    "2841": "ReadableStreamGetReader",
+    "2842": "ReadableStreamPipeThrough",
+    "2843": "ReadableStreamPipeTo",
+    "2844": "CSSStyleSheetReplace",
+    "2845": "CSSStyleSheetReplaceSync",
+    "2846": "AdoptedStyleSheets",
+    "2847": "HTMLImportsOnReverseOriginTrials",
+    "2848": "ElementCreateShadowRootOnReverseOriginTrials",
+    "2849": "DocumentRegisterElementOnReverseOriginTrials",
+    "2850": "InputTypeRadio",
+    "2851": "InputTypeCheckbox",
+    "2852": "InputTypeImage",
+    "2853": "InputTypeButton",
+    "2854": "InputTypeHidden",
+    "2855": "InputTypeReset",
+    "2856": "SelectElementSingle",
+    "2857": "SelectElementMultiple",
+    "2858": "V8Animation_Effect_AttributeGetter",
+    "2859": "V8Animation_Effect_AttributeSetter",
+    "2860": "HidDeviceClose",
+    "2861": "HidDeviceOpen",
+    "2862": "HidDeviceReceiveFeatureReport",
+    "2863": "HidDeviceSendFeatureReport",
+    "2864": "HidDeviceSendReport",
+    "2865": "HidGetDevices",
+    "2866": "HidRequestDevice",
+    "2867": "V8RTCQuicTransport_MaxDatagramLength_AttributeGetter",
+    "2868": "V8RTCQuicTransport_ReadyToSendDatagram_Method",
+    "2869": "V8RTCQuicTransport_SendDatagram_Method",
+    "2870": "V8RTCQuicTransport_ReceiveDatagrams_Method",
+    "2871": "CSSValueContainStyle",
+    "2872": "WebShareSuccessfulContainingFiles",
+    "2873": "WebShareSuccessfulWithoutFiles",
+    "2874": "WebShareUnsuccessfulContainingFiles",
+    "2875": "WebShareUnsuccessfulWithoutFiles",
+    "2876": "VerticalScrollbarThumbScrollingWithMouse",
+    "2877": "VerticalScrollbarThumbScrollingWithTouch",
+    "2878": "HorizontalScrollbarThumbScrollingWithMouse",
+    "2879": "HorizontalScrollbarThumbScrollingWithTouch",
+    "2880": "SMSReceiverStart",
+    "2881": "V8Animation_Pending_AttributeGetter",
+    "2882": "FocusWithoutUserActivationNotSandboxedNotAdFrame",
+    "2883": "FocusWithoutUserActivationNotSandboxedAdFrame",
+    "2884": "FocusWithoutUserActivationSandboxedNotAdFrame",
+    "2885": "FocusWithoutUserActivationSandboxedAdFrame",
+    "2886": "V8RTCRtpReceiver_JitterBufferDelayHint_AttributeGetter",
+    "2887": "V8RTCRtpReceiver_JitterBufferDelayHint_AttributeSetter",
+    "2888": "MediaCapabilitiesDecodingInfoWithKeySystemConfig",
+    "2889": "RevertInCustomIdent",
+    "2890": "UnoptimizedImagePolicies",
+    "2891": "VTTCueParser",
+    "2892": "MediaElementTextTrackContainer",
+    "2893": "MediaElementTextTrackList",
+    "2894": "PaymentRequestInitialized",
+    "2895": "PaymentRequestShow",
+    "2896": "PaymentRequestShippingAddressChange",
+    "2897": "PaymentRequestShippingOptionChange",
+    "2898": "PaymentRequestPaymentMethodChange",
+    "2899": "V8Animation_UpdatePlaybackRate_Method",
+    "2900": "TwoValuedOverflow",
+    "2901": "TextFragmentAnchor",
+    "2902": "TextFragmentAnchorMatchFound",
+    "2903": "NonPassiveTouchEventListener",
+    "2904": "PassiveTouchEventListener",
+    "2905": "CSSValueAppearanceSearchCancelForOthers2Rendered",
+    "2906": "WebXrFramebufferScale",
+    "2907": "WebXrIgnoreDepthValues",
+    "2908": "WebXrSessionCreated",
+    "2909": "V8XRReferenceSpace_GetOffsetReferenceSpace_Method",
+    "2910": "V8XRInputSource_Gamepad_AttributeGetter",
+    "2911": "V8XRSession_End_Method",
+    "2912": "V8XRWebGLLayer_Constructor",
+    "2913": "FetchKeepalive",
+    "2914": "CSSTransitionCancelledByRemovingStyle",
+    "2915": "V8RTCRtpSender_SetStreams_Method",
+    "2916": "CookieNoSameSite",
+    "2917": "CookieInsecureAndSameSiteNone",
+    "2918": "UnsizedMediaPolicy",
+    "2919": "ScrollByPrecisionTouchPad",
+    "2920": "PinchZoom",
+    "2921": "BuiltInModuleSwitchImported",
+    "2922": "FeaturePolicyCommaSeparatedDeclarations",
+    "2923": "FeaturePolicySemicolonSeparatedDeclarations",
+    "2924": "V8CallSiteAPIGetFunctionSloppyCall",
+    "2925": "V8CallSiteAPIGetThisSloppyCall",
+    "2926": "BuiltInModuleToast",
+    "2927": "LargestContentfulPaintExplicitlyRequested",
+    "2928": "PageLifecycleTransitionsOptIn",
+    "2929": "PageLifecycleTransitionsOptOut",
+    "2930": "PeriodicBackgroundSync",
+    "2931": "PeriodicBackgroundSyncRegister",
+    "2932": "LazyLoadFrameLoadingAttributeEager",
+    "2933": "LazyLoadFrameLoadingAttributeLazy",
+    "2934": "LazyLoadImageLoadingAttributeEager",
+    "2935": "LazyLoadImageLoadingAttributeLazy",
+    "2936": "LazyLoadImageMissingDimensionsForLazy",
+    "2937": "PeriodicBackgroundSyncGetTags",
+    "2938": "PeriodicBackgroundSyncUnregister",
+    "2939": "CreateObjectURLMediaSourceFromWorker",
+    "2940": "CSSAtRuleProperty",
+    "2941": "ServiceWorkerInterceptedRequestFromOriginDirtyStyleSheet",
+    "2942": "WebkitMarginBeforeCollapseDiscard",
+    "2943": "WebkitMarginBeforeCollapseSeparate",
+    "2944": "WebkitMarginBeforeCollapseSeparateMaybeDoesSomething",
+    "2945": "WebkitMarginAfterCollapseDiscard",
+    "2946": "WebkitMarginAfterCollapseSeparate",
+    "2947": "WebkitMarginAfterCollapseSeparateMaybeDoesSomething",
+    "2949": "CredentialManagerGetWithUVM",
+    "2951": "CredentialManagerGetSuccessWithUVM",
+    "2952": "DiscardInputEventToMovingIframe",
+    "2953": "SignedExchangeSubresourcePrefetch",
+    "2954": "BasicCardType",
+    "2955": "ExecutedJavaScriptURL",
+    "2956": "LinkPrefetchLoadEvent",
+    "2957": "LinkPrefetchErrorEvent",
+    "2958": "FontSizeWebkitXxxLarge",
+    "2959": "V8Database_ChangeVersion_Method",
+    "2960": "V8Database_Transaction_Method",
+    "2961": "V8Database_ReadTransaction_Method",
+    "2962": "V8SQLTransaction_ExecuteSql_Method",
+    "2963": "CSSValueAppearanceButtonForBootstrapLooseSelectorRendered",
+    "2964": "CSSValueAppearanceButtonForOthers2Rendered",
+    "2965": "CSSValueAppearanceButtonForSelectRendered",
+    "2966": "CSSValueAppearanceListboxForOthersRendered",
+    "2967": "CSSValueAppearanceMeterForOthersRendered",
+    "2968": "SVGSMILDiscardElementParsed",
+    "2969": "SVGSMILDiscardElementTriggered",
+    "2971": "V8PointerEvent_GetPredictedEvents_Method",
+    "2972": "ScrollSnapOnViewportBreaks",
+    "2973": "ScrollPaddingOnViewportBreaks",
+    "2974": "DownloadInAdFrame",
+    "2975": "DownloadInSandbox",
+    "2976": "DownloadWithoutUserGesture",
+    "2977": "AutoplayDynamicDelegation",
+    "2978": "ToggleEventHandlerDuringParsing",
+    "2979": "FragmentDoubleHash",
+    "2981": "OBSOLETE_CSSValueOverflowXOverlay",
+    "2982": "OBSOLETE_CSSValueOverflowYOverlay",
+    "2983": "ContentIndexAdd",
+    "2984": "ContentIndexDelete",
+    "2985": "ContentIndexGet",
+    "2986": "V8SpeechGrammar_Constructor",
+    "2987": "V8SpeechGrammarList_AddFromString_Method",
+    "2988": "V8SpeechGrammarList_Constructor",
+    "2989": "V8SpeechGrammarList_Item_Method",
+    "2990": "V8SpeechRecognition_Constructor",
+    "2991": "V8SpeechRecognition_Grammars_AttributeGetter",
+    "2992": "V8SpeechRecognition_Grammars_AttributeSetter",
+    "2993": "ContactsManagerSelect",
+    "2994": "V8MediaSession_SetPositionState_Method",
+    "2995": "CSSValueOverflowOverlay",
+    "2996": "RequestedFileSystemTemporary",
+    "2997": "RequestedFileSystemPersistent",
+    "2998": "ElementWithLeftwardOrUpwardOverflowDirection_ScrollLeftOrTop",
+    "2999": "ElementWithLeftwardOrUpwardOverflowDirection_ScrollLeftOrTopSetPositive",
+    "3000": "XMLHttpRequestSynchronousInMainFrame",
+    "3001": "XMLHttpRequestSynchronousInCrossOriginSubframe",
+    "3002": "XMLHttpRequestSynchronousInSameOriginSubframe",
+    "3003": "XMLHttpRequestSynchronousInWorker",
+    "3004": "PerformanceObserverBufferedFlag",
+    "3005": "WakeLockAcquireScreenLock",
+    "3006": "WakeLockAcquireSystemLock",
+    "3007": "ThirdPartyServiceWorker",
+    "3008": "JSSelfProfiling",
+    "3009": "HTMLFrameSetElement",
+    "3010": "MediaCapabilitiesFramerateRatio",
+    "3011": "MediaCapabilitiesFramerateNumber",
+    "3012": "FetchRedirectError",
+    "3013": "FetchRedirectManual",
+    "3014": "FetchCacheReload",
+    "3015": "V8Window_ChooseFileSystemEntries_Method",
+    "3016": "V8FileSystemDirectoryHandle_GetSystemDirectory_Method",
+    "3017": "NotificationShowTrigger",
+    "3018": "WebSocketStreamConstructor",
+    "3019": "DOMStorageRead",
+    "3020": "DOMStorageWrite",
+    "3021": "CacheStorageRead",
+    "3022": "CacheStorageWrite",
+    "3023": "IndexedDBRead",
+    "3024": "IndexedDBWrite",
+    "3025": "DeprecatedFileSystemRead",
+    "3026": "DeprecatedFileSystemWrite",
+    "3027": "PointerLockUnadjustedMovement",
+    "3028": "CreateObjectBlob",
+    "3029": "QuotaRead",
+    "3030": "DelegateFocus",
+    "3031": "DelegateFocusNotFirstInFlatTree",
+    "3032": "ThirdPartySharedWorker",
+    "3033": "ThirdPartyBroadcastChannel",
+    "3034": "MediaSourceGroupEndTimestampDecreaseWithinMediaSegment",
+    "3035": "TextFragmentAnchorTapToDismiss",
+    "3036": "XRIsSessionSupported",
+    "3037": "ScrollbarUseScrollbarButtonReversedDirection",
+    "3038": "CSSSelectorPseudoScrollbarButtonReversedDirection",
+    "3039": "FragmentHasTildeAmpersandTilde",
+    "3040": "FragmentHasColonTildeColon",
+    "3041": "FragmentHasTildeAtTilde",
+    "3042": "FragmentHasAmpersandDelimiterQuestion",
+    "3043": "InvalidFragmentDirective",
+    "3044": "ContactsManagerGetProperties",
+    "3045": "EvaluateScriptMovedBetweenElementDocuments",
+    "3046": "PluginElementLoadedDocument",
+    "3047": "PluginElementLoadedImage",
+    "3048": "PluginElementLoadedExternal",
+    "3049": "RenderSubtreeAttribute",
+    "3050": "ARIAAnnotationRoles",
+    "3051": "IntersectionObserverV2",
+    "3052": "HeavyAdIntervention",
+    "3053": "UserTimingL3",
+    "3054": "GetGamepadsFromCrossOriginSubframe",
+    "3055": "GetGamepadsFromInsecureContext",
+    "3056": "OriginCleanImageBitmapSerialization",
+    "3057": "NonOriginCleanImageBitmapSerialization",
+    "3058": "OriginCleanImageBitmapTransfer",
+    "3059": "NonOriginCleanImageBitmapTransfer",
+    "3060": "CompressionStreamConstructor",
+    "3061": "DecompressionStreamConstructor",
+    "3062": "V8RTCRtpReceiver_PlayoutDelayHint_AttributeGetter",
+    "3063": "V8RTCRtpReceiver_PlayoutDelayHint_AttributeSetter",
+    "3064": "V8RegExpExecCalledOnSlowRegExp",
+    "3065": "V8RegExpReplaceCalledOnSlowRegExp",
+    "3066": "HasMarkerPseudoElement",
+    "3067": "WindowMove",
+    "3068": "WindowResize",
+    "3069": "MovedOrResizedPopup",
+    "3070": "MovedOrResizedPopup2sAfterCreation",
+    "3071": "DOMWindowOpenPositioningFeatures",
+    "3072": "MouseEventScreenX",
+    "3073": "MouseEventScreenY",
+    "3074": "CredentialManagerIsUserVerifyingPlatformAuthenticatorAvailable",
+    "3075": "ObsoleteWebrtcTlsVersion",
+    "3076": "UpgradeInsecureRequestsUpgradedRequestBlockable",
+    "3077": "UpgradeInsecureRequestsUpgradedRequestOptionallyBlockable",
+    "3078": "UpgradeInsecureRequestsUpgradedRequestWebsocket",
+    "3079": "UpgradeInsecureRequestsUpgradedRequestForm",
+    "3080": "UpgradeInsecureRequestsUpgradedRequestUnknown",
+    "3081": "HasGlyphRelativeUnits",
+    "3082": "CountQueuingStrategyConstructor",
+    "3083": "ByteLengthQueuingStrategyConstructor",
+    "3084": "ClassicDedicatedWorker",
+    "3085": "ModuleDedicatedWorker",
+    "3086": "FetchBodyStreamInServiceWorker",
+    "3087": "FetchBodyStreamOutsideServiceWorker",
+    "3088": "GetComputedStyleOutsideFlatTree",
+    "3089": "ARIADescriptionAttribute",
+    "3090": "StrictMimeTypeChecksWouldBlockWorker",
+    "3091": "ResourceTimingTaintedOriginFlagFail",
+    "3092": "RegisterProtocolHandlerSameOriginAsTop",
+    "3093": "RegisterProtocolHandlerCrossOriginSubframe",
+    "3094": "WebNfcNdefReaderScan",
+    "3095": "WebNfcNdefWriterWrite",
+    "3096": "HTMLPortalElement",
+    "3097": "V8HTMLPortalElement_Activate_Method",
+    "3098": "V8HTMLPortalElement_PostMessage_Method",
+    "3099": "V8Window_PortalHost_AttributeGetter",
+    "3100": "V8PortalHost_PostMessage_Method",
+    "3101": "V8PortalActivateEvent_Data_AttributeGetter",
+    "3102": "V8PortalActivateEvent_AdoptPredecessor_Method",
+    "3103": "LinkRelPrefetchForSignedExchanges",
+    "3104": "MessageEventSharedArrayBufferSameOrigin",
+    "3105": "MessageEventSharedArrayBufferSameAgentCluster",
+    "3106": "MessageEventSharedArrayBufferDifferentAgentCluster",
+    "3107": "CacheStorageCodeCacheHint",
+    "3108": "V8Metadata_ModificationTime_AttributeGetter",
+    "3109": "V8RTCLegacyStatsReport_Timestamp_AttributeGetter",
+    "3110": "InputElementValueAsDateGetter",
+    "3111": "InputElementValueAsDateSetter",
+    "3112": "HTMLMetaElementReferrerPolicy",
+    "3113": "NonWebbyMixedContent",
+    "3114": "V8SharedArrayBufferConstructed",
+    "3115": "ScrollSnapCausesScrollOnInitialLayout",
+    "3116": "ClientHintsUAMobile",
+    "3117": "V8VideoPlaybackQuality_CorruptedVideoFrames_AttributeGetter",
+    "3118": "LongTaskBufferFull",
+    "3119": "HTMLMetaElementMonetization",
+    "3120": "HTMLLinkElementMonetization",
+    "3121": "InputTypeCheckboxRenderedNonSquare",
+    "3122": "InputTypeRadioRenderedNonSquare",
+    "3123": "WebkitBoxPackJustifyDoesSomething",
+    "3124": "WebkitBoxPackCenterDoesSomething",
+    "3125": "WebkitBoxPackEndDoesSomething",
+    "3126": "V8KeyframeEffect_Constructor",
+    "3127": "WebNfcAPI",
+    "3128": "HostCandidateAttributeGetter",
+    "3129": "CSPWithReasonableObjectRestrictions",
+    "3130": "CSPWithReasonableBaseRestrictions",
+    "3131": "CSPWithReasonableScriptRestrictions",
+    "3132": "CSPWithReasonableRestrictions",
+    "3133": "CSPROWithReasonableObjectRestrictions",
+    "3134": "CSPROWithReasonableBaseRestrictions",
+    "3135": "CSPROWithReasonableScriptRestrictions",
+    "3136": "CSPROWithReasonableRestrictions",
+    "3137": "CSPWithBetterThanReasonableRestrictions",
+    "3138": "CSPROWithBetterThanReasonableRestrictions",
+    "3139": "MeasureMemory",
+    "3140": "V8Animation_ReplaceState_AttributeGetter",
+    "3141": "V8Animation_Persist_Method",
+    "3142": "TaskControllerConstructor",
+    "3143": "TaskControllerSetPriority",
+    "3144": "TaskSignalPriority",
+    "3145": "SchedulerPostTask",
+    "3146": "V8Animation_Onremove_AttributeGetter",
+    "3147": "V8Animation_Onremove_AttributeSetter",
+    "3148": "ClassicSharedWorker",
+    "3149": "ModuleSharedWorker",
+    "3150": "V8Animation_CommitStyles_Method",
+    "3151": "SameOriginIframeWindowAlert",
+    "3152": "SameOriginIframeWindowConfirm",
+    "3153": "SameOriginIframeWindowPrompt",
+    "3154": "SameOriginIframeWindowPrint",
+    "3155": "LargeStickyAd",
+    "3156": "OverlayInterstitialAd",
+    "3157": "CSSComparisonFunctions",
+    "3158": "FeaturePolicyProposalWouldChangeBehaviour",
+    "3159": "RTCLocalSdpModificationSimulcast",
+    "3160": "TrustedTypesEnabledEnforcing",
+    "3161": "TrustedTypesEnabledReportOnly",
+    "3162": "TrustedTypesAllowDuplicates",
+    "3163": "V8ArrayPrototypeHasElements",
+    "3164": "V8ObjectPrototypeHasElements",
+    "3165": "DisallowDocumentAccess"
 }
 
 ##########################################################################
-#   CSS feature names from https://cs.chromium.org/chromium/src/third_party/blink/renderer/core/frame/use_counter.cc
+#   CSS feature names from https://cs.chromium.org/chromium/src/third_party/blink/renderer/core/frame/use_counter_helper.cc
 ##########################################################################
 CSS_FEATURES = {
     "2": "CSSPropertyColor",
@@ -3970,7 +4928,14 @@ CSS_FEATURES = {
     "633": "CSSPropertyInsetInlineStart",
     "634": "CSSPropertyInsetInlineEnd",
     "635": "CSSPropertyInsetInline",
-    "636": "CSSPropertyInset"
+    "636": "CSSPropertyInset",
+    "637": "CSSPropertyColorScheme",
+    "638": "CSSPropertyOverflowInline",
+    "639": "CSSPropertyOverflowBlock",
+    "640": "CSSPropertyForcedColorAdjust",
+    "641": "CSSPropertyInherits",
+    "642": "CSSPropertyInitialValue",
+    "643": "CSSPropertykSyntax"
 }
 
 if '__main__' == __name__:
